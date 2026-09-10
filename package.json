@@ -1,0 +1,75 @@
+{
+  "name": "@vinktarhq/browser",
+  "version": "0.1.0",
+  "description": "Vinktar for the browser: product analytics and error tracking in one small bundle.",
+  "keywords": [
+    "vinktar",
+    "analytics",
+    "error-tracking",
+    "monitoring",
+    "browser"
+  ],
+  "homepage": "https://vinktar.com",
+  "bugs": {
+    "url": "https://github.com/vinktarhq/browser/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vinktarhq/browser.git"
+  },
+  "license": "MIT",
+  "author": "john.vink",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "unpkg": "./dist/vinktar.min.js",
+  "jsdelivr": "./dist/vinktar.min.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./web-vitals": {
+      "types": "./dist/web-vitals.d.ts",
+      "import": "./dist/web-vitals.js",
+      "require": "./dist/web-vitals.cjs"
+    },
+    "./vinktar.min.js": "./dist/vinktar.min.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup && node scripts/postbuild.mjs",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm test && npm run size",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "size": "size-limit"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.0",
+    "@size-limit/preset-small-lib": "^11.1.0",
+    "@types/node": "^22.0.0",
+    "happy-dom": "^17.0.0",
+    "size-limit": "^11.1.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

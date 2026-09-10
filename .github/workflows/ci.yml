@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push: { branches: [main] }
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # The unit suite on every Node the toolchain promises: the core, and the client under a simulated DOM.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['18', '20', '22', '24']
+    name: test (node ${{ matrix.node }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}' }
+      - run: npm install
+      - run: npm run typecheck
+      - run: npm test
+
+  # Real browsers against the built bundle. Separate because it needs the browsers installed and
+  # takes minutes where the unit suite takes seconds.
+  browsers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: npm install
+      - run: npm run build
+      - run: npx playwright install --with-deps
+      - run: npm run test:e2e
+
+  # The bundle's size is a feature. A change that grows it past the budget fails here.
+  size:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: npm install
+      - run: npm run build
+      - run: npm run size
+
+  # The package as PUBLISHED, not as a source tree. `npm test` imports from `src/`, so it can pass
+  # while the tarball is unusable: an export map missing its `require` condition, a `files` list
+  # that ships no `dist`. Only installing the real thing catches those.
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    name: tarball
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: npm install
+      - name: install it somewhere else and use it
+        run: |
+          set -e
+          # `npm pack` prints the filename it wrote, so ask it rather than guessing the glob.
+          tarball="$PWD/$(npm pack --silent | tail -1)"
+          mkdir -p /tmp/consumer && cd /tmp/consumer
+          npm init -y > /dev/null
+          npm install "$tarball"
+          node -e "const m=require('@vinktarhq/browser'); if(typeof m.init!=='function') process.exit(1)"
+          node -e "const m=require('@vinktarhq/browser/web-vitals'); if(typeof m.webVitals!=='function') process.exit(1)"
+          node --input-type=module -e "const m=await import('@vinktarhq/browser'); if(typeof m.init!=='function') process.exit(1)"
+          test -f node_modules/@vinktarhq/browser/dist/vinktar.min.js

@@ -171,7 +171,8 @@ describe('errors', () => {
     err.stack = 'TypeError: boom\n    at inner (https://x/app.js:10:5)\n    at outer (https://x/app.js:20:1)';
     const id = client.captureException(err, { tags: { area: 'checkout' } });
     expect(id).toMatch(/^[0-9a-f]{32}$/);
-    await tick(5);
+    // Automatic delivery includes asynchronous compression; don't race it with a sleep.
+    await vi.waitFor(() => expect(harness.errors()).toHaveLength(1));
     const [error] = harness.errors();
     expect(error).toMatchObject({ event_id: id, level: 'error', release: '1.2.3', mechanism: { type: 'manual', handled: true, synthetic: false }, tags: { area: 'checkout' } });
     const exceptions = error!['exceptions'] as Array<{ stack: Array<{ function: string; col: number }> }>;
@@ -186,7 +187,7 @@ describe('errors', () => {
     const rejection = new Event('unhandledrejection') as Event & { reason?: unknown };
     rejection.reason = { code: 'PAYMENT_FAILED' };
     window.dispatchEvent(rejection);
-    await tick(5);
+    await client.flush();
     const errors = harness.errors();
     expect(errors.map((e) => (e['mechanism'] as { type: string }).type)).toEqual(['onerror', 'onunhandledrejection']);
     expect((errors[1]!['exceptions'] as Array<{ type: string; value: string }>)[0]).toMatchObject({ type: 'UnhandledRejection', value: 'PAYMENT_FAILED' });
@@ -204,7 +205,7 @@ describe('errors', () => {
     third.stack = 'Error: x\n    at f (https://cdn.third.party/w.js:1:1)';
     client.captureException(third);
     client.captureException(new Error('Script error.'));
-    await tick(5);
+    await client.flush();
     expect(harness.errors()).toHaveLength(1);
     await client.close();
   });
@@ -218,7 +219,8 @@ describe('errors', () => {
     button.click();
     button.click();
     client.captureException(new Error('after crumbs'));
-    await tick(5);
+    // Wait for the automatic send already in flight, including gzip compression.
+    await client.flush();
     const crumbs = harness.errors()[0]!['breadcrumbs'] as Array<{ category: string; message: string }>;
     expect(crumbs.map((c) => c.category)).toEqual(['console', 'ui.click']);
     expect(crumbs[0]!.message).toBe('user did a thing {"n":1}');
@@ -233,7 +235,7 @@ describe('errors', () => {
       client.captureMessage('one');
     });
     client.captureMessage('two');
-    await tick(5);
+    await client.flush();
     const errors = harness.errors();
     expect(errors[0]!['tags']).toEqual({ inside: 'yes' });
     expect(errors[1]!['tags']).toBeUndefined();

@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.2.0
+
+Delivery results could report success for data the server never kept, and several failure paths
+lost data quietly. This release fixes both and changes four behaviours your code may rely on:
+read "Changed" before upgrading.
+
+### Changed
+
+- `withScope()` returns the callback's value and lets an exception from it propagate. It used to
+  catch the exception, report it as unhandled, and return `undefined`.
+- `close()` returns `Promise<boolean>`, whether the final delivery was accepted. It stops accepting
+  events as soon as it is called, every call gets the same answer, and the new `shutdownTimeout`
+  option (default 2000 ms) bounds it.
+- `flush()` resolves `true` only when everything queued at the call was accepted. A batch that is
+  held, retrying, refused or partly rejected now resolves `false`. Neither result is an
+  application error; do not retry your own work because of it.
+- An error repeating within five seconds is sent once per window, and the window no longer
+  restarts on every repeat. An error that fires continuously now shows up as it happens instead of
+  once; those occurrences were real and hidden before. The suppressed repeats are counted in
+  client reports as `deduplicated`.
+
+### Fixed
+
+- Any 2xx counts as accepted. A 200 or 204 from a proxy was retried and eventually dropped.
+- Redirects are not followed. A 3xx from the ingest host stops sending with one error line
+  instead of sending the write key and the body to another location.
+- A storage outage (503) backs off exponentially instead of giving up after about two minutes,
+  and failed attempts while the browser is offline no longer count towards the retry limit.
+- A monthly cap holds until the server's reset time, checking again at most every six hours,
+  instead of always six hours.
+- A rate-limit header without a seconds part no longer cancels the wait the server asked for, and
+  a long hold on events no longer delays sending errors.
+- A `beforeTrack` or `beforeSend` hook that returns something unserialisable (a BigInt, a cycle, a
+  promise) drops only that record. It used to lose the whole batch, and could throw from the
+  persistence timer. Hook output is held to the same limits as the SDK's own.
+- Changing an object after passing it to `track()` no longer changes what is sent.
+- Payload and context properties together stay within the server's 255-property limit.
+- The request timeout covers compression and reading the response body.
+- After a 401 or 403 nothing more is queued and the flush timer stops.
+- Records sent while a tab is hidden are removed only once that request is answered, so a failed
+  send is retried instead of lost, and splitting an unload send no longer removes the wrong records.
+- A login or logout in another tab is adopted, so a tab left open does not keep sending the
+  previous person's ids.
+- `reset()` no longer takes first-touch attribution from the page it was called on.
+- `captureMessage()` honours `handled: false`.
+- Opting out no longer reports the discarded queue as failed sends.
+- Client reports are kept when the request carrying them is refused, are sent on only one request
+  when the page unloads, and go out on an explicit `flush()` even when nothing else is queued.
+- The queue is bounded by size as well as count, and a slow request no longer pushes out records
+  captured while it runs.
+
 ## 0.1.0
 
 First release.

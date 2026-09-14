@@ -20,7 +20,7 @@ beforeEach(async () => {
 });
 
 // Every client is closed after its test, so patches and listeners never leak between tests.
-const open: Array<{ close(): Promise<void> }> = [];
+const open: Array<{ close(): Promise<boolean> }> = [];
 const make = (options: Parameters<Facade['init']>[0]): InstanceType<Facade['Vinktar']> => {
   const client = new sdk.Vinktar(options);
   open.push(client);
@@ -228,6 +228,18 @@ describe('errors', () => {
     await client.close();
   });
 
+  it('withScope returns the value and lets the exception through unreported', async () => {
+    const client = make({ ...BASE, autoPageviews: false });
+    expect(client.withScope(() => 7)).toBe(7);
+    expect(() =>
+      client.withScope(() => {
+        throw new Error('application bug');
+      }),
+    ).toThrow('application bug');
+    await client.flush();
+    expect(harness.errors()).toHaveLength(0);
+  });
+
   it('withScope tags apply only inside', async () => {
     const client = make({ ...BASE, autoPageviews: false });
     client.withScope((scope) => {
@@ -274,8 +286,8 @@ describe('consent and persistence', () => {
     await second.close();
   });
 
-  it('sends what is queued on pagehide with keepalive and keeps the persisted copy', async () => {
-    const client = make({ ...BASE, autoPageviews: false, flushIntervalMs: 60_000 });
+  it('sends what is queued on pagehide with keepalive when beacons are off, and keeps the persisted copy', async () => {
+    const client = make({ ...BASE, autoPageviews: false, flushIntervalMs: 60_000, useBeacon: false });
     client.track('last thing');
     harness.reset();
     window.dispatchEvent(new Event('pagehide'));
@@ -291,6 +303,92 @@ describe('consent and persistence', () => {
     const b = make({ ...BASE, autoPageviews: false });
     expect(a.getDeviceId()).toBe(b.getDeviceId());
     expect(a.getSessionId()).toBe(b.getSessionId());
+  });
+});
+
+describe('lifecycle', () => {
+  it('close refuses new work at once and gives every caller the same answer', async () => {
+    harness.respond(503, { error: 'storage_unavailable' });
+    const client = make({ ...BASE, autoPageviews: false, shutdownTimeout: 200 });
+    client.track('before close');
+    const first = client.close();
+    const second = client.close();
+    client.track('after close');
+    expect(await first).toBe(false);
+    expect(await second).toBe(false);
+    expect(await client.close()).toBe(false);
+    expect(harness.batches().map((e) => e['name'])).toEqual(['before close']);
+  });
+
+  it('close answers true when the final delivery is accepted', async () => {
+    const client = make({ ...BASE, autoPageviews: false });
+    client.track('delivered');
+    expect(await client.close()).toBe(true);
+    expect(harness.batches().map((e) => e['name'])).toEqual(['delivered']);
+  });
+
+  it('opting out discards the queue without reporting it as a send failure', async () => {
+    const client = make({ ...BASE, autoPageviews: false });
+    client.track('before opting out');
+    client.optOut();
+    client.optIn();
+    client.track('after opting in');
+    await client.flush();
+    const discarded = harness.requests.flatMap((r) => (r.body['client_report'] as { discarded: Array<{ reason: string }> } | undefined)?.discarded ?? []);
+    expect(discarded.filter((d) => d.reason === 'send_error')).toHaveLength(0);
+    expect(harness.batches().map((e) => e['name'])).toEqual(['after opting in']);
+  });
+
+  it('does not hand the next person first-touch attribution taken from the logout page', async () => {
+    window.history.replaceState({}, '', '/landing?utm_source=newsletter');
+    const client = make({ ...BASE, autoPageviews: false });
+    client.track('first visit');
+    window.history.replaceState({}, '', '/logout?utm_source=logout');
+    client.reset();
+    client.track('next person');
+    await client.flush();
+    const initial = (name: string): string[] =>
+      Object.keys((harness.batches().find((e) => e['name'] === name)!['payload'] as Record<string, unknown>) ?? {}).filter((k) => k.startsWith('$initial_'));
+    expect(initial('first visit').length).toBeGreaterThan(0);
+    expect(initial('next person')).toEqual([]);
+    window.history.replaceState({}, '', '/');
+  });
+
+  it('adopts a login or logout made in another tab', () => {
+    const here = make({ ...BASE, autoPageviews: false });
+    const elsewhere = make({ ...BASE, autoPageviews: false });
+    elsewhere.identify('alice');
+    window.dispatchEvent(new Event('storage'));
+    expect(here.getUserId()).toBe('alice');
+    elsewhere.reset();
+    window.dispatchEvent(new Event('storage'));
+    expect(here.getUserId()).toBeNull();
+    expect(here.getDeviceId()).toBe(elsewhere.getDeviceId());
+  });
+
+  it('keeps records sent from a hidden tab until the keepalive request is answered', async () => {
+    const client = make({ ...BASE, autoPageviews: false, flushIntervalMs: 60_000 });
+    const hide = (state: 'hidden' | 'visible'): void => {
+      Object.defineProperty(document, 'visibilityState', { value: state, configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    };
+
+    client.track('answered');
+    harness.reset();
+    hide('hidden');
+    await tick(5);
+    hide('visible');
+    expect(harness.requests).toHaveLength(1);
+    expect(await client.flush()).toBe(true);
+    expect(harness.requests).toHaveLength(1);
+
+    harness.respond(503, { error: 'storage_unavailable' });
+    client.track('refused while hidden');
+    hide('hidden');
+    await tick(5);
+    hide('visible');
+    expect(await client.flush()).toBe(true);
+    expect(harness.batches().filter((e) => e['name'] === 'refused while hidden')).toHaveLength(2);
   });
 });
 
@@ -314,7 +412,7 @@ describe('transport policy through the client', () => {
     client.track('a');
     await client.flush();
     client.track('b');
-    await client.flush();
+    expect(await client.flush()).toBe(false);
     expect(harness.requests).toHaveLength(1);
     expect(lines.some((l) => l.includes('write key was refused'))).toBe(true);
     await client.close();

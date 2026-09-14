@@ -42,6 +42,8 @@ export interface VinktarOptions {
   flushIntervalMs?: number;
   maxQueueSize?: number;
   requestTimeoutMs?: number;
+  /** Milliseconds `close()` may spend on its final delivery. Default 2000. */
+  shutdownTimeout?: number;
   /** Compress bodies of 1 KiB and over. */
   gzip?: boolean;
   /** Keep the queue in localStorage across navigations and crashes. */
@@ -130,6 +132,7 @@ export interface Resolved {
   readonly flushIntervalMs: number;
   readonly maxQueueSize: number;
   readonly requestTimeoutMs: number;
+  readonly shutdownTimeout: number;
   readonly gzip: boolean;
   readonly persistQueue: boolean;
   readonly autoPageviews: { enabled: boolean; path: boolean; search: boolean; hash: boolean; leave: boolean };
@@ -177,7 +180,7 @@ export const DEFAULT_HOST = 'https://in.vinktar.com';
 
 const KNOWN = new Set<keyof VinktarOptions>([
   'writeKey', 'key', 'host', 'enabled', 'debug', 'analytics', 'errors', 'autoCaptureErrors', 'release', 'environment',
-  'enabledEnvironments', 'flushAt', 'flushIntervalMs', 'maxQueueSize', 'requestTimeoutMs', 'gzip', 'persistQueue',
+  'enabledEnvironments', 'flushAt', 'flushIntervalMs', 'maxQueueSize', 'requestTimeoutMs', 'shutdownTimeout', 'gzip', 'persistQueue',
   'autoPageviews', 'autocapture', 'sessionTimeoutMs', 'sessionMaxMs', 'breadcrumbs', 'maxBreadcrumbs', 'sampleRate',
   'errorSampleRate', 'maxErrorsPerMinute', 'maxEventsPerMinute', 'dedupe', 'ignoreErrors', 'denyUrls', 'allowUrls',
   'disableErrorDefaults', 'superProperties', 'sendDefaultPii', 'redactedKeys', 'propertyDenylist', 'disablePersistence',
@@ -274,6 +277,7 @@ export function resolve(options: VinktarOptions, logger: Logger): Resolved {
     flushIntervalMs: clamp('flushIntervalMs', options.flushIntervalMs, 250, 300_000, 10_000),
     maxQueueSize: clamp('maxQueueSize', options.maxQueueSize, 1, 10_000, 500),
     requestTimeoutMs: clamp('requestTimeoutMs', options.requestTimeoutMs, 1_000, 60_000, 10_000),
+    shutdownTimeout: clamp('shutdownTimeout', options.shutdownTimeout, 0, 60_000, 2_000),
     gzip: options.gzip ?? true,
     persistQueue: options.persistQueue ?? true,
     autoPageviews:

@@ -1,5 +1,5 @@
 [
-  { "name": "ESM (import, brotli)", "path": "dist/index.js", "limit": "21 kB", "import": "{ init }" },
-  { "name": "CDN bundle (brotli)", "path": "dist/vinktar.min.js", "limit": "22 kB" },
+  { "name": "ESM (import, brotli)", "path": "dist/index.js", "limit": "23 kB", "import": "{ init }" },
+  { "name": "CDN bundle (brotli)", "path": "dist/vinktar.min.js", "limit": "24 kB" },
   { "name": "web-vitals (brotli)", "path": "dist/web-vitals.js", "limit": "1.5 kB" }
 ]

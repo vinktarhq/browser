@@ -2,10 +2,12 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import { BLOCKED_IDS, isBlockedId } from '../src/core/blocked.js';
-import { decide, networkFailure } from '../src/core/decide.js';
+import { BATCH_CATEGORIES, ERROR_CATEGORIES } from '../src/core/backoff.js';
+import { decide, holdCategories, networkFailure, parseRetryAfter } from '../src/core/decide.js';
 import { DENY_MESSAGES, EXTENSION_SCHEMES } from '../src/core/filters.js';
 import * as limits from '../src/core/limits.js';
 import { hashUnit } from '../src/core/sampling.js';
+import { CATEGORIES, DROP_REASONS } from '../src/core/reports.js';
 import { parseStack } from '../src/core/stack.js';
 import { parseTraits, RESERVED_TRAITS, TRAIT_ALIASES } from '../src/core/traits.js';
 
@@ -50,6 +52,12 @@ describe('limits.json', () => {
     expect(errors['frameOrder']).toBe('crash-last');
     expect(errors['exceptionOrder']).toBe('thrown-first');
     expect(errors['columnBase']).toBe(0);
+  });
+
+  it('names only the client-report reasons and categories the server records', () => {
+    const reports = json['reports']!;
+    expect([...DROP_REASONS].sort()).toEqual([...(reports['reasons'] as string[])].sort());
+    expect([...CATEGORIES].sort()).toEqual([...(reports['categories'] as string[])].sort());
   });
 });
 
@@ -153,23 +161,43 @@ describe('fixtures/stacks.json', () => {
 describe('fixtures/responses.json', () => {
   interface Case {
     name: string;
+    endpoint?: string;
     status: number;
     body: unknown;
+    headers?: Record<string, string>;
     action: string;
     degrade?: string;
-    holdSeconds?: number | 'escalating';
-    retrySeconds?: number;
+    wait?: number | 'escalating';
+    categories?: string[];
+    billing?: boolean;
   }
   const json = spec<{ cases: Case[] }>('fixtures/responses.json');
+  const now = Date.parse('2026-01-01T00:00:00Z');
+  const header = (c: Case, name: string): string | undefined => {
+    const value = c.headers?.[name];
+    const date = value === undefined ? null : /^<<now\+(\d+)s as HTTP-date>>$/.exec(value);
+
+    return date ? new Date(now + Number(date[1]) * 1000).toUTCString() : value;
+  };
 
   for (const c of json.cases) {
     it(c.name, () => {
-      const decision = c.status === 0 ? networkFailure() : decide(c.status, c.body, { retryAfter: c.retrySeconds ?? 0 });
+      const decision =
+        c.status === 0
+          ? networkFailure()
+          : decide(c.status, c.body, {
+              retryAfter: parseRetryAfter(header(c, 'Retry-After'), now),
+              rateLimitCategories: header(c, 'X-RateLimit-Categories') ?? '',
+            });
       expect(decision.action).toBe(c.action);
       if (c.degrade !== undefined) expect(decision.degrade).toBe(c.degrade);
-      if (typeof c.holdSeconds === 'number') expect(decision.wait).toBe(c.holdSeconds);
-      if (c.holdSeconds === 'escalating') expect(decision.wait).toBe(0);
-      if (c.retrySeconds !== undefined) expect(decision.wait).toBe(c.retrySeconds);
+      if (typeof c.wait === 'number') expect(decision.wait).toBe(c.wait);
+      if (c.wait === 'escalating') expect(decision.wait).toBe(0);
+      if (c.billing !== undefined) expect(decision.billing === true).toBe(c.billing);
+      if (c.categories !== undefined) {
+        const governed = c.endpoint === '/v1/errors' ? ERROR_CATEGORIES : BATCH_CATEGORIES;
+        expect(holdCategories(governed, decision.categories)).toEqual(c.categories);
+      }
     });
   }
 });

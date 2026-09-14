@@ -17,10 +17,11 @@ import { coerce, CORE_COERCERS, exceptionKey, fromMessage, isMeaningless, issueK
 import { crashFile, DEFAULT_IGNORE, isServerSuppressed, matches } from './core/filters.js';
 import { runHooks } from './core/hooks.js';
 import { hexId, uuidv7 } from './core/ids.js';
-import { MAX_FINGERPRINT_PART_BYTES, MAX_FINGERPRINT_PARTS, MAX_TAG_KEY_BYTES, MAX_TAG_VALUE_BYTES, MAX_TAGS, type Level } from './core/limits.js';
+import { MAX_FINGERPRINT_PART_BYTES, MAX_FINGERPRINT_PARTS, MAX_PROPERTIES_PER_EVENT, MAX_TAG_KEY_BYTES, MAX_TAG_VALUE_BYTES, MAX_TAGS, type Level } from './core/limits.js';
 import type { Logger } from './core/logger.js';
-import { normalize, normalizeTags, parseJson, type NormalizeOptions, type Props } from './core/normalize.js';
+import { capCombined, normalize, normalizeTags, parseJson, type NormalizeOptions, type Props } from './core/normalize.js';
 import type { Entry } from './core/queue.js';
+import type { Category, DropReason } from './core/reports.js';
 import { sampled } from './core/sampling.js';
 import { parseStack, syntheticFrame } from './core/stack.js';
 import { describeTraitDrop, parseTraits, type Traits } from './core/traits.js';
@@ -45,6 +46,12 @@ import { VERSION } from './version.js';
  *   4. **Never throw.** Not from a public method, not from a handler, not from a hook.
  */
 const PENDING_ERRORS = 50;
+// The persisted queue shares the origin's localStorage quota (about five million characters) with
+// the application, so the SDK keeps well under it.
+const QUEUE_BYTES = 2 * 1024 * 1024;
+/** How soon the counts of what was dropped are sent when nothing else is going out to carry them. */
+const REPORT_INTERVAL_MS = 60_000;
+const ERROR_QUEUE_BYTES = 512 * 1024;
 
 export class Vinktar {
   readonly version = VERSION;
@@ -72,6 +79,7 @@ export class Vinktar {
   private supers: Props = {};
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
+  private closing: Promise<boolean> | null = null;
   private inert: string | null;
   private pageKey = '';
   private pageStarted = 0;
@@ -122,8 +130,17 @@ export class Vinktar {
       logger: this.logger,
       maxQueueSize: this.o.maxQueueSize,
       maxPendingErrors: PENDING_ERRORS,
+      maxQueueBytes: QUEUE_BYTES,
+      maxPendingErrorBytes: ERROR_QUEUE_BYTES,
       gzip: this.o.gzip,
-      onShutdown: () => this.persistence?.clear(),
+      // The transport has its own deadline; this one only catches a patched fetch that ignores it.
+      sendTimeoutMs: this.o.requestTimeoutMs + 1_000,
+      timers: { set: (fn, ms) => natives.setTimeout(fn, ms), clear: (handle) => natives.clearTimeout(handle as ReturnType<typeof setTimeout>) },
+      isOnline: () => natives.window?.navigator.onLine !== false,
+      // A refused key's queue is gone; a redirect's stays persisted for when the host is fixed.
+      onShutdown: (code) => {
+        if (code !== 'redirect') this.persistence?.clear();
+      },
       onBilling: () => this.o.onError?.(new Error('vinktar: the monthly cap was reached; events are paused')),
     });
 
@@ -214,17 +231,26 @@ export class Vinktar {
     // Unload: `pagehide` and `visibilitychange` → hidden, never `unload`, which disables the
     // back/forward cache and does not fire on mobile. `pageshow` undoes the unloading state when
     // the same page instance is restored from that cache.
-    const onHide = (): void => this.onUnload();
-    this.instrumentation.listen(win, 'pagehide', onHide);
+    this.instrumentation.listen(win, 'pagehide', () => this.onUnload(true));
     this.instrumentation.listen(doc, 'visibilitychange', () => {
-      if (doc.visibilityState === 'hidden') onHide();
+      if (doc.visibilityState === 'hidden') this.onUnload(false);
+      // A tab coming back may have missed a logout elsewhere (a cookie store fires no event).
+      else this.adoptSharedIdentity();
     });
     this.instrumentation.listen(win, 'pageshow', () => {
       if (this.dispatcher.pending > 0) this.scheduleFlush(this.o.flushIntervalMs);
     });
     this.instrumentation.listen(win, 'online', () => {
       this.dispatcher.backoff.clear();
-      this.scheduleFlush(0);
+      // Not at once: the first requests after a network change often fail (ERR_NETWORK_CHANGED),
+      // and every tab on the page's network would otherwise retry at the same instant.
+      this.rescheduleFlush(1_000 + Math.floor(Math.random() * 4_000));
+    });
+    // Another tab logged out or identified: this tab must stop sending the previous person's ids.
+    this.instrumentation.listen(win, 'storage', (event) => {
+      const key = (event as Partial<StorageEvent>).key;
+      // A null key is storage being cleared; anything that is not a string is not worth trusting.
+      if (typeof key !== 'string' || key.startsWith(namespaceFor(this.o.writeKey))) this.adoptSharedIdentity();
     });
 
     const host: IntegrationHost = {
@@ -266,17 +292,18 @@ export class Vinktar {
         return;
       }
       if (!this.eventValve.take()) {
-        this.dispatcher.reports.record('ratelimit', 'event');
+        this.drop('ratelimit', 'event');
         this.logger.warn(`more than ${this.o.maxEventsPerMinute} events in a minute; dropping until the valve refills`);
 
         return;
       }
       if (!sampled(this.identity.deviceId, this.o.sampleRate)) {
-        this.dispatcher.reports.record('sample_rate', 'event');
+        this.drop('sample_rate', 'event');
 
         return;
       }
 
+      const context = normalize(pageContext(this.o), this.normalizeOptions);
       const payload = normalize(
         { ...this.o.superProperties, ...this.supers, ...(typeof properties === 'object' && properties !== null ? properties : {}) },
         this.normalizeOptions,
@@ -288,20 +315,26 @@ export class Vinktar {
         timestamp: new Date().toISOString(),
         device_id: this.identity.deviceId,
         session_id: this.identity.sessionId(),
-        payload,
-        context: normalize(pageContext(this.o), this.normalizeOptions),
+        payload: this.capProperties(name, payload, context),
+        context,
       };
       if (this.identity.userId !== null) event['user_id'] = this.identity.userId;
 
       const hooked = runHooks(this.o.beforeTrack, event);
       if (hooked.value === null) {
-        this.dispatcher.reports.record('before_send', 'event');
+        this.drop('before_send', 'event');
         if (hooked.threw !== undefined) this.logger.warn('beforeTrack threw; the event was dropped', { error: String(hooked.threw) });
 
         return;
       }
 
-      this.dispatcher.events.push('event', hooked.value);
+      const final = this.o.beforeTrack.length > 0 ? this.renormalizeEvent(name, hooked.value) : hooked.value;
+      if (!this.dispatcher.events.push('event', final)) {
+        this.drop('before_send', 'event');
+        this.logger.warn(`"${name}" was dropped: beforeTrack returned something that cannot be sent (a BigInt, a cycle, or a promise)`);
+
+        return;
+      }
       this.afterCapture();
     });
   }
@@ -402,6 +435,7 @@ export class Vinktar {
   reset(): void {
     this.guarded(() => {
       if (this.closed) return;
+      // Best effort, and safe: queued records already carry the identity they were captured with.
       void this.flush();
       this.identity.reset();
       this.crumbs.clear();
@@ -409,8 +443,9 @@ export class Vinktar {
       this.context = { ...this.o.initialScope.context };
       this.supers = {};
       this.stores.data.remove(this.keys.sup);
+      // First-touch attribution belonged to the person who just left. Deriving it again from the
+      // logout page would hand the next person a referrer of "/logout", so it is simply gone.
       this.stores.data.remove(this.keys.attr);
-      for (const [key, value] of Object.entries(initialAttribution(this.stores.data, this.keys.attr, this.o.sendDefaultPii))) this.supers[key] = value;
       this.logger.debug('reset: new device id', { deviceId: this.identity.deviceId });
     });
   }
@@ -458,7 +493,8 @@ export class Vinktar {
       if (frames.length > 2) frames = frames.slice(0, -2);
       const exceptions = fromMessage(text, frames);
 
-      return this.emit(exceptions, false, 'manual', true, hint ?? {}, hint?.level ?? 'info');
+      // Synthetic: the stack, if any, is the SDK's own call site, not where anything failed.
+      return this.emit(exceptions, true, 'manual', hint?.handled ?? true, hint ?? {}, hint?.level ?? 'info');
     }, '');
   }
 
@@ -529,18 +565,31 @@ export class Vinktar {
     }
     const file = crashFile(first.stack);
     if (file !== '') {
-      if (this.o.denyUrls.length > 0 && matches(this.o.denyUrls, file)) return '';
-      if (this.o.allowUrls.length > 0 && !matches(this.o.allowUrls, file)) return '';
+      if (this.o.denyUrls.length > 0 && matches(this.o.denyUrls, file)) {
+        this.logger.debug('ignored by denyUrls', { file });
+
+        return '';
+      }
+      if (this.o.allowUrls.length > 0 && !matches(this.o.allowUrls, file)) {
+        this.logger.debug('not in allowUrls', { file });
+
+        return '';
+      }
     }
-    if (this.o.dedupe && this.dedupe.isDuplicate(exceptionKey(exceptions))) return '';
+    if (this.o.dedupe && this.dedupe.isDuplicate(exceptionKey(exceptions))) {
+      this.drop('deduplicated', 'error');
+      this.logger.debug('repeat of an error sent moments ago; counted, not sent', { message });
+
+      return '';
+    }
     if (!this.errorValve.take() || !this.typeValve.take(first.type)) {
-      this.dispatcher.reports.record('ratelimit', 'error');
+      this.drop('ratelimit', 'error');
       this.logger.warn(`more than ${this.o.maxErrorsPerMinute} errors in a minute; dropping until the valve refills`);
 
       return '';
     }
     if (!sampled(issueKey(exceptions), this.o.errorSampleRate)) {
-      this.dispatcher.reports.record('sample_rate', 'error');
+      this.drop('sample_rate', 'error');
 
       return '';
     }
@@ -573,13 +622,19 @@ export class Vinktar {
 
     const hooked = runHooks(this.o.beforeSend, event);
     if (hooked.value === null) {
-      this.dispatcher.reports.record('before_send', 'error');
+      this.drop('before_send', 'error');
       if (hooked.threw !== undefined) this.logger.warn('beforeSend threw; the error was dropped', { error: String(hooked.threw) });
 
       return '';
     }
 
-    this.dispatcher.errors.push('error', hooked.value);
+    const final = this.o.beforeSend.length > 0 ? this.renormalizeError(hooked.value) : hooked.value;
+    if (!this.dispatcher.errors.push('error', final)) {
+      this.drop('before_send', 'error');
+      this.logger.warn('an error was dropped: beforeSend returned something that cannot be sent (a BigInt, a cycle, or a promise)');
+
+      return '';
+    }
     this.persist();
     // Errors go now: the page that produced one may be about to go away.
     void this.flush();
@@ -627,16 +682,20 @@ export class Vinktar {
     };
   }
 
-  /** Run `work` with tags and context that are discarded afterwards. Synchronous by design. */
-  withScope<T>(work: (scope: Scope) => T): T | undefined {
+  /**
+   * Run `work` with tags and context that are discarded afterwards, and return what it returns.
+   *
+   * Synchronous: the scope is restored when `work` returns, so tags set after an `await` inside it
+   * are not isolated. A page has one person at a time and no async context to hang a scope on.
+   * An exception from `work` is the application's and goes straight back to it, unreported: the
+   * SDK changing control flow, or reporting an error the application is about to handle, would be
+   * worse than useless.
+   */
+  withScope<T>(work: (scope: Scope) => T): T {
     const tags = { ...this.tags };
     const context = { ...this.context };
     try {
       return work(this.scope());
-    } catch (error) {
-      this.captureException(error, { handled: false });
-
-      return undefined;
     } finally {
       this.tags = tags;
       this.context = context;
@@ -648,8 +707,9 @@ export class Vinktar {
   optOut(): void {
     this.guarded(() => {
       this.identity.setConsent(false);
-      this.dispatcher.events.discardAll('send_error');
-      this.dispatcher.errors.discardAll('send_error');
+      // The visitor's own instruction, not a failure: nothing to report, and nowhere to report it.
+      this.dispatcher.events.discardAll(null);
+      this.dispatcher.errors.discardAll(null);
       this.persistence?.clear();
       this.logger.debug('opted out');
     });
@@ -682,28 +742,61 @@ export class Vinktar {
 
   // Lifecycle -----------------------------------------------------------------------------------
 
-  async flush(): Promise<boolean> {
-    if (this.closed || this.inert !== null) return true;
-    if (!this.identity.allowed) return true;
+  /**
+   * Send what is queued. True only when everything that was queued when the call started was
+   * accepted; false while any of it is still held, retrying, or was refused. Reusable: a false
+   * flush can be called again.
+   */
+  flush(): Promise<boolean> {
+    if (this.inert !== null) return Promise.resolve(true);
+    if (this.closing !== null) return this.closing;
+    if (!this.identity.allowed) return Promise.resolve(true);
+
+    return this.flushNow();
+  }
+
+  /**
+   * Stop, and make one last bounded attempt to deliver. New captures are refused from the moment
+   * it is called. Every call, including one made while the first is still running, gets the same
+   * answer. Records it could not deliver stay in the persisted queue for the next page.
+   */
+  close(): Promise<boolean> {
+    if (this.closing === null) {
+      this.closed = true;
+      this.closing = this.shutdown();
+    }
+
+    return this.closing;
+  }
+
+  private async flushNow(): Promise<boolean> {
     if (this.flushTimer !== null) {
       natives.clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
     const ok = await this.dispatcher.flush();
     this.persist();
-    if (this.dispatcher.pending > 0 && !this.closed) this.scheduleFlush(Math.max(this.dispatcher.nextRetryIn(), this.o.flushIntervalMs));
+    if (this.closing === null && !this.dispatcher.isStopped) {
+      if (this.dispatcher.pending > 0) this.scheduleFlush(Math.max(this.dispatcher.nextRetryIn(), this.o.flushIntervalMs));
+      else if (!this.dispatcher.reports.isEmpty) this.scheduleFlush(REPORT_INTERVAL_MS);
+    }
 
     return ok;
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  private async shutdown(): Promise<boolean> {
+    if (this.flushTimer !== null) natives.clearTimeout(this.flushTimer);
+    this.flushTimer = null;
+
+    let ok = true;
     try {
-      await this.flush();
+      if (this.inert === null && this.identity.allowed) ok = await this.bounded(this.flushNow(), this.o.shutdownTimeout);
+      if (!ok && this.dispatcher.pending > 0) {
+        this.logger.warn(`close(): ${this.dispatcher.pending} record(s) were not delivered${this.persistence !== null ? '; they stay queued for the next page' : ''}`);
+      }
+    } catch {
+      ok = false;
     } finally {
-      this.closed = true;
-      if (this.flushTimer !== null) natives.clearTimeout(this.flushTimer);
-      this.flushTimer = null;
       for (const teardown of this.teardowns.splice(0)) {
         try {
           teardown();
@@ -713,7 +806,27 @@ export class Vinktar {
       }
       this.instrumentation.teardown();
       this.dispatcher.stop();
+      this.persist(true);
     }
+
+    return ok;
+  }
+
+  /** The promise's answer, or false once `ms` has passed. */
+  private bounded(work: Promise<boolean>, ms: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const timer = natives.setTimeout(() => resolve(false), ms);
+      work.then(
+        (value) => {
+          natives.clearTimeout(timer);
+          resolve(value);
+        },
+        () => {
+          natives.clearTimeout(timer);
+          resolve(false);
+        },
+      );
+    });
   }
 
   // Internals -----------------------------------------------------------------------------------
@@ -726,6 +839,12 @@ export class Vinktar {
     }
     if (this.inert !== null) {
       this.logger.debug(`${method}(): inert (${this.inert})`);
+
+      return false;
+    }
+    if (this.dispatcher.isStopped) {
+      // Already said once, loudly, when the server refused the key or redirected.
+      this.logger.debug(`${method}(): sending has stopped`);
 
       return false;
     }
@@ -744,6 +863,18 @@ export class Vinktar {
     else this.scheduleFlush(this.o.flushIntervalMs);
   }
 
+  /** Count a record the SDK did not send, and make sure the count itself goes out. */
+  private drop(reason: DropReason, category: Category): void {
+    this.dispatcher.reports.record(reason, category);
+    this.scheduleFlush(REPORT_INTERVAL_MS);
+  }
+
+  private rescheduleFlush(ms: number): void {
+    if (this.flushTimer !== null) natives.clearTimeout(this.flushTimer);
+    this.flushTimer = null;
+    this.scheduleFlush(ms);
+  }
+
   private scheduleFlush(ms: number): void {
     if (this.closed || this.flushTimer !== null) return;
     this.flushTimer = natives.setTimeout(() => {
@@ -753,37 +884,98 @@ export class Vinktar {
   }
 
   private persist(immediate = false): void {
-    this.persistence?.save(this.dispatcher.events.peek(), this.dispatcher.errors.peek(), immediate);
+    // A getter, not the arrays: a throttled write runs later, and must write the queue as it is then.
+    this.persistence?.save(() => ({ events: this.dispatcher.events.peek(), errors: this.dispatcher.errors.peek() }), immediate);
   }
 
-  private onUnload(): void {
+  /**
+   * `pagehide` (leaving) or `visibilitychange` to hidden (maybe coming back).
+   *
+   * The persisted copy is written FIRST: it is what survives if the send does not. A keepalive
+   * request can still report its answer when the page stays alive, so its records are removed
+   * only on a 2xx. A beacon reports nothing, so its records are removed only when the page is
+   * really leaving; a tab that is merely hidden keeps them and sends them normally later.
+   */
+  private onUnload(leaving: boolean): void {
     this.guarded(() => {
       if (this.closed || this.inert !== null) return;
       this.identity.flushSession();
       if (this.o.autoPageviews.leave) this.pageLeave();
-      if (!this.identity.allowed) return;
-      // The persisted copy is written FIRST: it is what survives if the send does not.
+      if (!this.identity.allowed || this.dispatcher.isStopped) return;
       this.persist(true);
-      for (const { out, entries } of this.dispatcher.buildAll()) this.sendUnload(out.endpoint, entries);
+      const requests = this.dispatcher.buildAll();
+      requests.forEach(({ out, entries }, index) => this.sendUnload(out.endpoint, entries, index === 0, leaving));
+      // Nothing queued, but drops counted: the last chance to send those counts from this page.
+      if (requests.length === 0 && !this.dispatcher.reports.isEmpty) this.sendUnload('/v1/batch', [], true, leaving);
     });
   }
 
-  /** Beacon what fits; halve what does not; give up under the floor. Never deletes the persisted slot. */
-  private sendUnload(endpoint: Endpoint, entries: readonly Entry[]): void {
-    const out = this.dispatcher.buildRequest(endpoint, entries);
-    const result = this.transport.sendOnUnload(out);
-    if (result === 'sent') {
-      const queue = endpoint === '/v1/errors' ? this.dispatcher.errors : this.dispatcher.events;
-      queue.take(entries.length);
+  /** Keepalive or beacon what fits; halve what does not; give up under the floor. */
+  private sendUnload(endpoint: Endpoint, entries: readonly Entry[], withReport: boolean, leaving: boolean): void {
+    const queue = endpoint === '/v1/errors' ? this.dispatcher.errors : this.dispatcher.events;
+    const out = this.dispatcher.buildRequest(endpoint, entries, withReport);
+    const result = this.transport.sendOnUnload(
+      out,
+      () => {
+        // Answered while the page was still here: exactly these records, wherever they are now.
+        queue.remove(entries);
+        this.dispatcher.commitReport(out);
+        this.persist();
+      },
+      leaving,
+    );
+    if (result === 'sent') return;
+    if (result === 'beacon') {
+      if (leaving) {
+        queue.remove(entries);
+        this.dispatcher.commitReport(out);
+      }
 
       return;
     }
     if (result === 'too_large' && entries.length > 1) {
       const half = Math.ceil(entries.length / 2);
-      this.sendUnload(endpoint, entries.slice(0, half));
-      this.sendUnload(endpoint, entries.slice(half));
+      this.sendUnload(endpoint, entries.slice(0, half), withReport, leaving);
+      this.sendUnload(endpoint, entries.slice(half), false, leaving);
     }
-    // 'refused': the browser's beacon quota is spent. The persisted copy goes out with the next page.
+    // 'refused': the browser's quota is spent. The persisted copy goes out with the next page.
+  }
+
+  /** Payload keys past what the server allows alongside this event's context, dropped with a warning. */
+  private capProperties(name: string, payload: Props, context: Props): Props {
+    return capCombined(payload, context, MAX_PROPERTIES_PER_EVENT, (key) =>
+      this.logger.warn(`property "${key}" on "${name}" was dropped: an event carries at most ${MAX_PROPERTIES_PER_EVENT} properties and context together`),
+    );
+  }
+
+  /** A hook may have added anything. Its output meets the same limits the SDK's own did. */
+  private renormalizeEvent(name: string, event: Record<string, unknown>): Record<string, unknown> {
+    if (typeof event !== 'object' || event === null) return event;
+    const out = { ...event };
+    const context = isRecord(out['context']) ? normalize(out['context'], this.normalizeOptions) : {};
+    if (isRecord(out['context'])) out['context'] = context;
+    if (isRecord(out['payload'])) out['payload'] = this.capProperties(name, normalize(out['payload'], this.normalizeOptions), context);
+
+    return out;
+  }
+
+  private renormalizeError(event: Record<string, unknown>): Record<string, unknown> {
+    if (typeof event !== 'object' || event === null) return event;
+    const out = { ...event };
+    if (isRecord(out['context'])) out['context'] = normalize(out['context'], this.normalizeOptions);
+    if (isRecord(out['tags'])) out['tags'] = normalizeTags(out['tags'], MAX_TAGS, MAX_TAG_KEY_BYTES, MAX_TAG_VALUE_BYTES);
+
+    return out;
+  }
+
+  /** Take on the identity another tab wrote, together with the properties it registered. */
+  private adoptSharedIdentity(): void {
+    this.guarded(() => {
+      if (this.closed || this.inert !== null) return;
+      if (!this.identity.reload()) return;
+      this.supers = (parseJson(this.stores.data.get(this.keys.sup)) as Props | undefined) ?? {};
+      this.logger.debug('identity changed in another tab; adopted', { deviceId: this.identity.deviceId });
+    });
   }
 
   private noteScroll(): void {
@@ -819,4 +1011,8 @@ export class Vinktar {
       return fallback as T;
     }
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

@@ -123,7 +123,7 @@ export function setContext(context: Props | null): void {
   call('setContext', [context], undefined);
 }
 
-export function withScope<T>(work: (scope: Scope) => T): T | undefined {
+export function withScope<T>(work: (scope: Scope) => T): T {
   if (client !== null) return client.withScope(work);
   // Without a client there is no scope to fork; the work still runs.
   const noop: Scope = { setTag: () => {}, setTags: () => {}, setContext: () => {} };
@@ -151,11 +151,11 @@ export function flush(): Promise<boolean> {
   return client?.flush() ?? Promise.resolve(true);
 }
 
-export function close(): Promise<void> {
+export function close(): Promise<boolean> {
   const current = client;
   client = null;
 
-  return current?.close() ?? Promise.resolve();
+  return current?.close() ?? Promise.resolve(true);
 }
 
 export function getDeviceId(): string {

@@ -36,7 +36,10 @@ export function installHarness(): Harness {
     requests.push({ url, method: init?.method ?? 'GET', headers, body: JSON.parse(raw), keepalive: init?.keepalive === true, gzip: headers['content-encoding'] === 'gzip' });
     const next = script.shift() ?? { status: 202, body: { received: 1, rejected: 0, errors: [] }, headers: {} };
 
-    return new Response(JSON.stringify(next.body), { status: next.status, headers: next.headers });
+    // A 204, 205 or 304 has no body, and Response refuses to construct one with a body.
+    const bodyless = next.status === 204 || next.status === 205 || next.status === 304;
+
+    return new Response(bodyless ? null : JSON.stringify(next.body), { status: next.status, headers: next.headers });
   });
   vi.stubGlobal('fetch', fetchMock);
 

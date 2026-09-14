@@ -126,6 +126,30 @@ export class Identity {
     this.lastSessionWrite = 0;
   }
 
+  /**
+   * Re-read the shared identity. Another tab may have logged out (a new device, no user) or
+   * identified someone; a tab that kept its own copy in memory would go on sending the previous
+   * person's ids. Returns whether anything changed.
+   */
+  reload(): boolean {
+    const did = this.stores.identity.get(this.k.did);
+    const uid = this.stores.identity.get(this.k.uid);
+    const user = typeof uid === 'string' && uid !== '' && !isBlockedId(uid) ? uid : null;
+    const device = looksLikeId(did) ? did : this.device;
+    const opt = this.stores.identity.get(this.k.opt);
+    const consent: Consent = opt === '1' ? 'granted' : opt === '0' ? 'denied' : 'pending';
+    if (device === this.device && user === this.user && consent === this.consentState) return false;
+
+    this.device = device;
+    this.user = user;
+    this.consentState = consent;
+    const links = parseJson(this.stores.data.get(this.k.lnk));
+    this.links = Array.isArray(links) ? links.filter((l): l is string => typeof l === 'string').slice(-MAX_LINKS_REMEMBERED) : [];
+    this.session = this.readSession();
+
+    return true;
+  }
+
   // Sessions ------------------------------------------------------------------------------------
 
   /** The current session id, extending it with this activity. */

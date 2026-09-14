@@ -73,7 +73,11 @@ export interface DispatcherOptions {
   readonly timers?: Timers;
   /** False while the runtime knows it is offline. Failures then do not spend the retry budget. */
   readonly isOnline?: () => boolean;
-  /** A 401/403 or a redirect was seen. The client stops accepting work. */
+  /**
+   * A 401/403 or a redirect was seen, and nothing more will be sent. After a refused key the queue
+   * has already been discarded. After a redirect it is kept: the host is misconfigured, not the
+   * data, and a persisted queue or a spool can deliver it once the host is fixed.
+   */
   readonly onShutdown?: (code: string) => void;
   /** A monthly cap. Surfaced once, loudly. */
   readonly onBilling?: (code: string) => void;
@@ -320,12 +324,14 @@ export class Dispatcher {
 
           case 'shutdown': {
             this.stopped = true;
+            const redirect = decision.code === 'redirect';
             this.options.logger.error(
-              decision.code === 'redirect'
-                ? `the ingest host answered with a redirect (${delivery.status}); it was not followed, and nothing more will be sent. Point host at the ingest URL itself`
+              redirect
+                ? `the ingest host answered with a redirect (${delivery.status}); it was not followed, and nothing more will be sent from here. Point host at the ingest URL itself; what is queued is kept`
                 : `the write key was refused (${decision.code}); nothing more will be sent`,
             );
-            this.abandon('send_error');
+            // A key that is refused will never work, so its queue can never be delivered.
+            if (!redirect) this.abandon('send_error');
             this.options.onShutdown?.(decision.code);
 
             return { kind: 'stop' };

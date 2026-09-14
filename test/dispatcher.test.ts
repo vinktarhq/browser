@@ -168,6 +168,18 @@ describe('dispatcher', () => {
     expect(sent).toHaveLength(1);
   });
 
+  it('keeps what is queued after a redirect, for when the host is fixed, but discards after a refused key', async () => {
+    const redirected = make([{ status: 308, body: null }]);
+    redirected.d.events.push('event', { name: 'kept' });
+    expect(await redirected.d.flush()).toBe(false);
+    expect(redirected.d.pending).toBe(1);
+
+    const refused = make([{ status: 403, body: { error: 'write_scope_required' } }]);
+    refused.d.events.push('event', { name: 'gone' });
+    expect(await refused.d.flush()).toBe(false);
+    expect(refused.d.pending).toBe(0);
+  });
+
   it('reports a refused batch as a failed flush and keeps the client report for the next request', async () => {
     const { d, sent } = make([{ status: 400, body: { error: 'invalid_payload' } }]);
     d.reports.record('sample_rate', 'event', 2);

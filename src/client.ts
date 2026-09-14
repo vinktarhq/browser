@@ -21,6 +21,7 @@ import { MAX_FINGERPRINT_PART_BYTES, MAX_FINGERPRINT_PARTS, MAX_PROPERTIES_PER_E
 import type { Logger } from './core/logger.js';
 import { capCombined, normalize, normalizeTags, parseJson, type NormalizeOptions, type Props } from './core/normalize.js';
 import type { Entry } from './core/queue.js';
+import type { Category, DropReason } from './core/reports.js';
 import { sampled } from './core/sampling.js';
 import { parseStack, syntheticFrame } from './core/stack.js';
 import { describeTraitDrop, parseTraits, type Traits } from './core/traits.js';
@@ -48,6 +49,8 @@ const PENDING_ERRORS = 50;
 // The persisted queue shares the origin's localStorage quota (about five million characters) with
 // the application, so the SDK keeps well under it.
 const QUEUE_BYTES = 2 * 1024 * 1024;
+/** How soon the counts of what was dropped are sent when nothing else is going out to carry them. */
+const REPORT_INTERVAL_MS = 60_000;
 const ERROR_QUEUE_BYTES = 512 * 1024;
 
 export class Vinktar {
@@ -134,7 +137,10 @@ export class Vinktar {
       sendTimeoutMs: this.o.requestTimeoutMs + 1_000,
       timers: { set: (fn, ms) => natives.setTimeout(fn, ms), clear: (handle) => natives.clearTimeout(handle as ReturnType<typeof setTimeout>) },
       isOnline: () => natives.window?.navigator.onLine !== false,
-      onShutdown: () => this.persistence?.clear(),
+      // A refused key's queue is gone; a redirect's stays persisted for when the host is fixed.
+      onShutdown: (code) => {
+        if (code !== 'redirect') this.persistence?.clear();
+      },
       onBilling: () => this.o.onError?.(new Error('vinktar: the monthly cap was reached; events are paused')),
     });
 
@@ -236,7 +242,9 @@ export class Vinktar {
     });
     this.instrumentation.listen(win, 'online', () => {
       this.dispatcher.backoff.clear();
-      this.scheduleFlush(0);
+      // Not at once: the first requests after a network change often fail (ERR_NETWORK_CHANGED),
+      // and every tab on the page's network would otherwise retry at the same instant.
+      this.rescheduleFlush(1_000 + Math.floor(Math.random() * 4_000));
     });
     // Another tab logged out or identified: this tab must stop sending the previous person's ids.
     this.instrumentation.listen(win, 'storage', (event) => {
@@ -284,13 +292,13 @@ export class Vinktar {
         return;
       }
       if (!this.eventValve.take()) {
-        this.dispatcher.reports.record('ratelimit', 'event');
+        this.drop('ratelimit', 'event');
         this.logger.warn(`more than ${this.o.maxEventsPerMinute} events in a minute; dropping until the valve refills`);
 
         return;
       }
       if (!sampled(this.identity.deviceId, this.o.sampleRate)) {
-        this.dispatcher.reports.record('sample_rate', 'event');
+        this.drop('sample_rate', 'event');
 
         return;
       }
@@ -314,7 +322,7 @@ export class Vinktar {
 
       const hooked = runHooks(this.o.beforeTrack, event);
       if (hooked.value === null) {
-        this.dispatcher.reports.record('before_send', 'event');
+        this.drop('before_send', 'event');
         if (hooked.threw !== undefined) this.logger.warn('beforeTrack threw; the event was dropped', { error: String(hooked.threw) });
 
         return;
@@ -322,7 +330,7 @@ export class Vinktar {
 
       const final = this.o.beforeTrack.length > 0 ? this.renormalizeEvent(name, hooked.value) : hooked.value;
       if (!this.dispatcher.events.push('event', final)) {
-        this.dispatcher.reports.record('before_send', 'event');
+        this.drop('before_send', 'event');
         this.logger.warn(`"${name}" was dropped: beforeTrack returned something that cannot be sent (a BigInt, a cycle, or a promise)`);
 
         return;
@@ -569,19 +577,19 @@ export class Vinktar {
       }
     }
     if (this.o.dedupe && this.dedupe.isDuplicate(exceptionKey(exceptions))) {
-      this.dispatcher.reports.record('deduplicated', 'error');
+      this.drop('deduplicated', 'error');
       this.logger.debug('repeat of an error sent moments ago; counted, not sent', { message });
 
       return '';
     }
     if (!this.errorValve.take() || !this.typeValve.take(first.type)) {
-      this.dispatcher.reports.record('ratelimit', 'error');
+      this.drop('ratelimit', 'error');
       this.logger.warn(`more than ${this.o.maxErrorsPerMinute} errors in a minute; dropping until the valve refills`);
 
       return '';
     }
     if (!sampled(issueKey(exceptions), this.o.errorSampleRate)) {
-      this.dispatcher.reports.record('sample_rate', 'error');
+      this.drop('sample_rate', 'error');
 
       return '';
     }
@@ -614,7 +622,7 @@ export class Vinktar {
 
     const hooked = runHooks(this.o.beforeSend, event);
     if (hooked.value === null) {
-      this.dispatcher.reports.record('before_send', 'error');
+      this.drop('before_send', 'error');
       if (hooked.threw !== undefined) this.logger.warn('beforeSend threw; the error was dropped', { error: String(hooked.threw) });
 
       return '';
@@ -622,7 +630,7 @@ export class Vinktar {
 
     const final = this.o.beforeSend.length > 0 ? this.renormalizeError(hooked.value) : hooked.value;
     if (!this.dispatcher.errors.push('error', final)) {
-      this.dispatcher.reports.record('before_send', 'error');
+      this.drop('before_send', 'error');
       this.logger.warn('an error was dropped: beforeSend returned something that cannot be sent (a BigInt, a cycle, or a promise)');
 
       return '';
@@ -768,8 +776,9 @@ export class Vinktar {
     }
     const ok = await this.dispatcher.flush();
     this.persist();
-    if (this.dispatcher.pending > 0 && this.closing === null && !this.dispatcher.isStopped) {
-      this.scheduleFlush(Math.max(this.dispatcher.nextRetryIn(), this.o.flushIntervalMs));
+    if (this.closing === null && !this.dispatcher.isStopped) {
+      if (this.dispatcher.pending > 0) this.scheduleFlush(Math.max(this.dispatcher.nextRetryIn(), this.o.flushIntervalMs));
+      else if (!this.dispatcher.reports.isEmpty) this.scheduleFlush(REPORT_INTERVAL_MS);
     }
 
     return ok;
@@ -854,6 +863,18 @@ export class Vinktar {
     else this.scheduleFlush(this.o.flushIntervalMs);
   }
 
+  /** Count a record the SDK did not send, and make sure the count itself goes out. */
+  private drop(reason: DropReason, category: Category): void {
+    this.dispatcher.reports.record(reason, category);
+    this.scheduleFlush(REPORT_INTERVAL_MS);
+  }
+
+  private rescheduleFlush(ms: number): void {
+    if (this.flushTimer !== null) natives.clearTimeout(this.flushTimer);
+    this.flushTimer = null;
+    this.scheduleFlush(ms);
+  }
+
   private scheduleFlush(ms: number): void {
     if (this.closed || this.flushTimer !== null) return;
     this.flushTimer = natives.setTimeout(() => {
@@ -882,7 +903,10 @@ export class Vinktar {
       if (this.o.autoPageviews.leave) this.pageLeave();
       if (!this.identity.allowed || this.dispatcher.isStopped) return;
       this.persist(true);
-      this.dispatcher.buildAll().forEach(({ out, entries }, index) => this.sendUnload(out.endpoint, entries, index === 0, leaving));
+      const requests = this.dispatcher.buildAll();
+      requests.forEach(({ out, entries }, index) => this.sendUnload(out.endpoint, entries, index === 0, leaving));
+      // Nothing queued, but drops counted: the last chance to send those counts from this page.
+      if (requests.length === 0 && !this.dispatcher.reports.isEmpty) this.sendUnload('/v1/batch', [], true, leaving);
     });
   }
 

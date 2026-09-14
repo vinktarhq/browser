@@ -286,8 +286,8 @@ describe('consent and persistence', () => {
     await second.close();
   });
 
-  it('sends what is queued on pagehide with keepalive and keeps the persisted copy', async () => {
-    const client = make({ ...BASE, autoPageviews: false, flushIntervalMs: 60_000 });
+  it('sends what is queued on pagehide with keepalive when beacons are off, and keeps the persisted copy', async () => {
+    const client = make({ ...BASE, autoPageviews: false, flushIntervalMs: 60_000, useBeacon: false });
     client.track('last thing');
     harness.reset();
     window.dispatchEvent(new Event('pagehide'));

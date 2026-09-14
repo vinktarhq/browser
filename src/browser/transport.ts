@@ -19,12 +19,14 @@ import { natives } from './natives.js';
  * **One deadline per request covers all of it**: compression, the request, and reading the body.
  * A response that sends its headers and then stalls is a timeout, not a success.
  *
- * **`fetch(..., { keepalive })` has a shared 64 KiB in-flight budget** per page. Under it, an
- * unload send can carry the write key in a header like any other request; over it, the request is
- * refused outright. So keepalive is used only for bodies under ~51 KiB with fewer than fifteen in
- * flight, and the unload path falls back to `sendBeacon`, whose body must stay CORS-simple
- * (`text/plain`, never `application/json`) because a preflight cannot complete while the page is
- * going away. The server parses JSON regardless of the declared type, so nothing is lost.
+ * **Everything sent while the page goes away is CORS-simple**: `text/plain`, no custom header, the
+ * key in the query string. A request that needs a preflight does not survive unload everywhere
+ * (WebKit drops it), and a beacon cannot carry headers at all. The server parses JSON regardless
+ * of the declared type and reads the key from `_k`, so nothing is lost.
+ *
+ * **`fetch(..., { keepalive })` has a shared 64 KiB in-flight budget** per page; over it, the
+ * request is refused outright. So keepalive is used only for bodies under ~51 KiB with fewer than
+ * fifteen in flight, and the unload path falls back to `sendBeacon` otherwise.
  *
  * **Third-party code patches `fetch`**, sometimes to throw synchronously. The SDK holds the
  * pristine reference from `natives.ts` and still wraps the call, so a wrapper installed before
@@ -148,20 +150,27 @@ export class BrowserTransport implements Transport {
   }
 
   /**
-   * One attempt, synchronous, for `pagehide` and a hidden tab. A keepalive request that gets a 2xx
-   * while the page is still alive calls `onAccepted`; a beacon only ever says the browser took it.
-   * A refusal at a body over the split floor means the payload is too big; under it, the page's
-   * quota is exhausted and halving will not help.
+   * One attempt, synchronous, for `pagehide` and a hidden tab.
+   *
+   * A page that is **leaving** gets a beacon first: no answer could arrive anyway, and a beacon is
+   * what every engine delivers most reliably while a page goes away (WebKit drops a keepalive
+   * request there). A page that is merely **hidden** gets a keepalive request first, because it may
+   * still be alive to hear the answer, and then `onAccepted` is called on a 2xx. Each falls back to
+   * the other. A refusal at a body over the split floor means the payload is too big; under it,
+   * the page's quota is exhausted and halving will not help.
    */
-  sendOnUnload(out: Outbound, onAccepted?: () => void): UnloadResult {
+  sendOnUnload(out: Outbound, onAccepted?: () => void, leaving = false): UnloadResult {
     const size = byteLength(out.body);
+    const url = `${this.options.host}${out.endpoint}?_k=${encodeURIComponent(this.options.writeKey)}`;
+
+    if (leaving && this.beacon(url, out.body)) return 'beacon';
 
     if (natives.fetch !== undefined && size <= KEEPALIVE_BODY_LIMIT && this.inFlight < KEEPALIVE_MAX_INFLIGHT) {
       try {
         void natives
-          .fetch(`${this.options.host}${out.endpoint}`, {
+          .fetch(url, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-Vinktar-Key': this.options.writeKey },
+            headers: { 'Content-Type': 'text/plain' },
             body: out.body,
             keepalive: true,
             credentials: 'omit',
@@ -179,19 +188,22 @@ export class BrowserTransport implements Transport {
       }
     }
 
+    if (!leaving && this.beacon(url, out.body)) return 'beacon';
     if (!this.options.useBeacon || natives.sendBeacon === undefined || natives.Blob === undefined) {
       return size > KEEPALIVE_BODY_LIMIT ? 'too_large' : 'refused';
     }
 
+    return size > BEACON_SPLIT_FLOOR_BYTES ? 'too_large' : 'refused';
+  }
+
+  private beacon(url: string, body: string): boolean {
+    if (!this.options.useBeacon || natives.sendBeacon === undefined || natives.Blob === undefined) return false;
     try {
-      const blob = new natives.Blob([out.body], { type: 'text/plain' });
-      const url = `${this.options.host}${out.endpoint}?_k=${encodeURIComponent(this.options.writeKey)}`;
-      if (natives.sendBeacon(url, blob)) return 'beacon';
+      return natives.sendBeacon(url, new natives.Blob([body], { type: 'text/plain' }));
     } catch {
       // A beacon that throws is a beacon that was refused.
+      return false;
     }
-
-    return size > BEACON_SPLIT_FLOOR_BYTES ? 'too_large' : 'refused';
   }
 
   private async compress(text: string): Promise<Uint8Array | null> {

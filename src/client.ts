@@ -890,12 +890,16 @@ export class Vinktar {
   private sendUnload(endpoint: Endpoint, entries: readonly Entry[], withReport: boolean, leaving: boolean): void {
     const queue = endpoint === '/v1/errors' ? this.dispatcher.errors : this.dispatcher.events;
     const out = this.dispatcher.buildRequest(endpoint, entries, withReport);
-    const result = this.transport.sendOnUnload(out, () => {
-      // Answered while the page was still here: exactly these records, wherever they are now.
-      queue.remove(entries);
-      this.dispatcher.commitReport(out);
-      this.persist();
-    });
+    const result = this.transport.sendOnUnload(
+      out,
+      () => {
+        // Answered while the page was still here: exactly these records, wherever they are now.
+        queue.remove(entries);
+        this.dispatcher.commitReport(out);
+        this.persist();
+      },
+      leaving,
+    );
     if (result === 'sent') return;
     if (result === 'beacon') {
       if (leaving) {

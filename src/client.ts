@@ -240,8 +240,9 @@ export class Vinktar {
     });
     // Another tab logged out or identified: this tab must stop sending the previous person's ids.
     this.instrumentation.listen(win, 'storage', (event) => {
-      const key = (event as StorageEvent).key;
-      if (key === null || key.startsWith(namespaceFor(this.o.writeKey))) this.adoptSharedIdentity();
+      const key = (event as Partial<StorageEvent>).key;
+      // A null key is storage being cleared; anything that is not a string is not worth trusting.
+      if (typeof key !== 'string' || key.startsWith(namespaceFor(this.o.writeKey))) this.adoptSharedIdentity();
     });
 
     const host: IntegrationHost = {

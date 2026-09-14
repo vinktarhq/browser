@@ -30,7 +30,7 @@ Or, with no build step at all:
 That is the whole setup. Pageviews are sent automatically, including single-page-app route
 changes, and uncaught errors are reported with their stack, breadcrumbs and the current user.
 
-**About 20 kB compressed. Zero runtime dependencies. Never throws into your code.** Everything
+**About 22 kB compressed. Zero runtime dependencies. Never throws into your code.** Everything
 the SDK cannot send is said out loud in the console once, never silently dropped.
 
 ---
@@ -108,7 +108,8 @@ shared browser the next person would otherwise be attributed to the previous one
 mints a new device id; the SDK warns when it sees a device being linked to a second user.
 
 `setUser({ id, ...traits })` is the same call in the shape other SDKs use; `setUser(null)` is
-`reset()`.
+`reset()`. A logout in one tab applies to the others: a tab left open picks up the new device id
+instead of going on sending the previous person's.
 
 Sessions rotate after 30 minutes without activity or 24 hours in total, are shared across tabs,
 and survive a clock that jumps. `crossSubdomainCookie: true` shares the device and session
@@ -132,10 +133,15 @@ withScope((scope) => {
 });
 ```
 
+`withScope` returns what its callback returns and lets anything it throws go straight back to you,
+unreported. The tags are restored when the callback returns, so work after an `await` inside it is
+not covered.
+
 What is filtered before anything is sent, so noise costs nothing: errors that come entirely from
 browser extensions, the well-known list of unactionable browser messages
 (`disableErrorDefaults: true` turns it off), your own `ignoreErrors`, `denyUrls` / `allowUrls`
-tested against the frame where the crash happened, exact repeats within five seconds, and a
+tested against the frame where the crash happened, repeats within five seconds of an error's first
+occurrence (counted, not sent), and a
 per-minute valve (25 by default) so a render loop cannot spend a month's quota in an afternoon.
 Recursive stacks are collapsed to one copy of their cycle, so a stack overflow is one issue rather
 than one per place the runtime happened to cut it.
@@ -190,7 +196,8 @@ Every number is clamped to a sane range with a warning rather than taken as give
 | `enabledEnvironments` | `[]` | Send only from these environments. |
 | `flushAt` / `flushIntervalMs` | `20` / `10000` | Batch size and interval. Errors and identifies do not wait. |
 | `maxQueueSize` | `500` | Oldest events are dropped past this, and counted. |
-| `requestTimeoutMs` | `10000` | |
+| `requestTimeoutMs` | `10000` | Per request, including compression and reading the response. |
+| `shutdownTimeout` | `2000` | How long `close()` may spend on its final delivery. |
 | `gzip` | `true` | Compress bodies of 1 KiB and over. |
 | `persistQueue` | `true` | Keep the queue in localStorage across navigations and crashes. |
 | `autoPageviews` | `true` | Or `{ path, search, hash, leave }`. |
@@ -200,7 +207,7 @@ Every number is clamped to a sane range with a warning rather than taken as give
 | `maxBreadcrumbs` | `30` | At most 50. |
 | `sampleRate` / `errorSampleRate` | `1` | Per device / per issue, deterministic. |
 | `maxEventsPerMinute` / `maxErrorsPerMinute` | `600` / `25` | Client-side valves. |
-| `dedupe` | `true` | Drop an identical error within five seconds. |
+| `dedupe` | `true` | Send an identical error once per five seconds; the repeats are counted. |
 | `ignoreErrors` / `denyUrls` / `allowUrls` | `[]` | Strings (substring) or regular expressions. |
 | `disableErrorDefaults` | `false` | Turn off the built-in browser-noise list. |
 | `superProperties` | `{}` | On every event, under whatever `register()` persisted. |
@@ -252,17 +259,32 @@ page is `localhost`, which reports under the `development` environment.
 ## How it works
 
 Events are batched and sent as JSON, compressed over 1 KiB, to `/v1/batch`; errors go to
-`/v1/errors` immediately. A `202` means the batch is durably stored and the SDK forgets it. A
-`503` means it was **not** stored and the SDK keeps it. `429` pauses only the throttled category
-(a throttled event stream never delays an error). `413` halves the batch. `401`/`403` stop the SDK
-for good with one loud line. Everything else backs off exponentially with jitter, capped at
-thirty minutes; a request that never got an answer at all (offline, or a blocker) gets three
-attempts.
+`/v1/errors` immediately. Any `2xx` means the batch was accepted and the SDK forgets it. A `503`
+means it was **not** stored and the SDK keeps it, backing off from the server's `Retry-After`.
+`429` pauses only the throttled category (a throttled event stream never delays an error); a
+monthly cap pauses sending and checks again at most every six hours. `413` halves the batch.
+`401`/`403`, or a redirect, stop the SDK for good with one loud line; a redirect is never
+followed, because following it would send the write key somewhere else. Everything else backs
+off exponentially with jitter, capped at thirty minutes; a request that never got an answer at
+all (a blocker, or the host unreachable) gets three attempts, and attempts made while the browser
+is offline do not count.
 
 The queue is persisted to localStorage per tab and written synchronously when the page is hidden
-or unloaded, then sent with a keepalive request or a beacon. The persisted copy is not deleted on
-that path, because a beacon never reports success; the next page on the origin adopts any slot
-that is over a minute old and sends it, and the server deduplicates on the event id.
+or unloaded, then sent with a keepalive request or a beacon. A keepalive request answered while
+the page is still open removes its records; otherwise the persisted copy stays, because a beacon
+never reports success. The next page on the origin adopts any slot that is over a minute old and
+sends it, and the server deduplicates on the event id.
+
+```ts
+const delivered = await flush();   // true when everything queued was accepted
+await close();                     // stop, one bounded last attempt, the same answer every call
+```
+
+`flush()` resolves `true` only when every event and error queued at the call was accepted. A batch
+waiting out a rate limit, retrying after a failure, or refused by the server resolves `false`; the
+SDK keeps retrying on its own, and you can call it again. `close()` stops accepting events at once
+and makes one last attempt, bounded by `shutdownTimeout`. Neither ever throws, and a `false` is
+about telemetry, not about your application: never retry your own work because of it.
 
 Every request carries exactly three headers (`Content-Type`, `Content-Encoding` and
 `X-Vinktar-Key`); the SDK identifies itself inside the body. The SDK captures the platform's

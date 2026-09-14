@@ -20,7 +20,7 @@ beforeEach(async () => {
 });
 
 // Every client is closed after its test, so patches and listeners never leak between tests.
-const open: Array<{ close(): Promise<void> }> = [];
+const open: Array<{ close(): Promise<boolean> }> = [];
 const make = (options: Parameters<Facade['init']>[0]): InstanceType<Facade['Vinktar']> => {
   const client = new sdk.Vinktar(options);
   open.push(client);

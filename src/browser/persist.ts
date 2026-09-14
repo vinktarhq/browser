@@ -22,8 +22,8 @@ import type { Store } from './storage.js';
  */
 interface Slot {
   readonly t: number;
-  readonly e: Entry[];
-  readonly x: Entry[];
+  readonly e: unknown[];
+  readonly x: unknown[];
 }
 
 const ORPHAN_AFTER_MS = 60_000;
@@ -55,9 +55,9 @@ export class QueuePersistence {
   }
 
   /** Everything this tab may send: its own slot and any abandoned ones. */
-  restore(): { events: Entry[]; errors: Entry[] } {
-    const events: Entry[] = [];
-    const errors: Entry[] = [];
+  restore(): { events: Array<Pick<Entry, 'category' | 'item'>>; errors: Array<Pick<Entry, 'category' | 'item'>> } {
+    const events: Array<Pick<Entry, 'category' | 'item'>> = [];
+    const errors: Array<Pick<Entry, 'category' | 'item'>> = [];
     const now = this.now();
     const floor = now - MAX_QUEUE_AGE_MS;
 
@@ -80,19 +80,22 @@ export class QueuePersistence {
     return { events, errors };
   }
 
-  save(events: readonly Entry[], errors: readonly Entry[], immediate = false): void {
+  /** `read` is called when the write happens, which for a throttled write is later than now. */
+  save(read: () => { events: readonly Entry[]; errors: readonly Entry[] }, immediate = false): void {
     if (immediate) {
-      this.write(events, errors);
+      if (this.timer !== null) this.cancel(this.timer);
+      this.timer = null;
+      this.write(read());
 
       return;
     }
     const since = this.now() - this.lastWrite;
     if (since >= WRITE_THROTTLE_MS) {
-      this.write(events, errors);
+      this.write(read());
     } else if (this.timer === null) {
       this.timer = this.schedule(() => {
         this.timer = null;
-        this.write(events, errors);
+        this.write(read());
       }, WRITE_THROTTLE_MS - since);
     }
   }
@@ -103,21 +106,27 @@ export class QueuePersistence {
     this.store.remove(this.key);
   }
 
-  private write(events: readonly Entry[], errors: readonly Entry[]): void {
+  private write({ events, errors }: { events: readonly Entry[]; errors: readonly Entry[] }): void {
     this.lastWrite = this.now();
     if (events.length + errors.length === 0) {
       this.store.remove(this.key);
 
       return;
     }
-    const slot: Slot = { t: this.lastWrite, e: events.slice(), x: errors.slice() };
-    this.store.set(this.key, JSON.stringify(slot));
+    // Only what a later page needs. Queued items are sealed, so this cannot throw on their account;
+    // the guard is for the store, which runs inside a timer where nothing would catch it.
+    const slim = (list: readonly Entry[]): Array<Pick<Entry, 'category' | 'item'>> => list.map(({ category, item }) => ({ category, item }));
+    try {
+      this.store.set(this.key, JSON.stringify({ t: this.lastWrite, e: slim(events), x: slim(errors) }));
+    } catch (error) {
+      this.logger.debug('could not persist the queue', { error: String(error) });
+    }
   }
 }
 
-function valid(list: unknown, floor: number): Entry[] {
+function valid(list: unknown, floor: number): Array<Pick<Entry, 'category' | 'item'>> {
   if (!Array.isArray(list)) return [];
-  const out: Entry[] = [];
+  const out: Array<Pick<Entry, 'category' | 'item'>> = [];
   for (const raw of list) {
     if (typeof raw !== 'object' || raw === null) continue;
     const entry = raw as Partial<Entry>;

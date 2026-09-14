@@ -6,11 +6,18 @@ import { parseJson } from '../core/normalize.js';
 import { natives } from './natives.js';
 
 /**
- * HTTP for the browser, with the three constraints that shape it:
+ * HTTP for the browser, with the constraints that shape it:
  *
  * **Only three request headers exist**: `Content-Type`, `Content-Encoding` and `X-Vinktar-Key`.
  * Anything else fails the CORS preflight, the failure is cached for a day, and every send on the
  * page dies with it. SDK identity rides inside the body, in `context.$lib`.
+ *
+ * **Redirects are never followed.** `fetch` follows them by default and sends the body and the
+ * write key to wherever `Location` points. An ingest host that redirects is misconfigured, and the
+ * dispatcher stops on the 3xx this reports.
+ *
+ * **One deadline per request covers all of it**: compression, the request, and reading the body.
+ * A response that sends its headers and then stalls is a timeout, not a success.
  *
  * **`fetch(..., { keepalive })` has a shared 64 KiB in-flight budget** per page. Under it, an
  * unload send can carry the write key in a header like any other request; over it, the request is
@@ -31,16 +38,19 @@ export interface BrowserTransportOptions {
   readonly useBeacon: boolean;
 }
 
+/** What an unload send came to. `sent` will still call back on a 2xx; `beacon` never can. */
+export type UnloadResult = 'sent' | 'beacon' | 'too_large' | 'refused';
+
 export const GZIP_THRESHOLD_BYTES = 1024;
 export const KEEPALIVE_BODY_LIMIT = Math.floor(64 * 1024 * 0.8);
 export const KEEPALIVE_MAX_INFLIGHT = 15;
 export const BEACON_SPLIT_FLOOR_BYTES = 16 * 1024;
 
 const NETWORK_ERROR = /Failed to fetch|NetworkError|Load failed|network error/i;
+const TIMED_OUT = 'vinktar: request timed out';
 
 export class BrowserTransport implements Transport {
   private inFlight = 0;
-  private inFlightBytes = 0;
   private gzipBroken = false;
 
   constructor(private readonly options: BrowserTransportOptions) {}
@@ -53,55 +63,68 @@ export class BrowserTransport implements Transport {
     const fetch = natives.fetch;
     if (fetch === undefined) return { status: 0, body: null };
 
-    const headers: Record<string, string> = { 'Content-Type': 'application/json', 'X-Vinktar-Key': this.options.writeKey };
-    let body: BodyInit = out.body;
-    const size = byteLength(out.body);
-
-    if (gzip && this.canCompress && size >= GZIP_THRESHOLD_BYTES) {
-      const compressed = await this.compress(out.body);
-      if (compressed !== null) {
-        body = compressed as BodyInit;
-        headers['Content-Encoding'] = 'gzip';
-      }
-    }
-
     const controller = natives.AbortController !== undefined ? new natives.AbortController() : undefined;
     let timedOut = false;
+    let expire: () => void = () => {};
+    // Raced against every await below, so a step that ignores the abort signal still ends on time.
+    const deadline = new Promise<never>((_, reject) => {
+      expire = () => reject(new Error(TIMED_OUT));
+    });
+    deadline.catch(() => {});
     // Detected by flag, not by comparing the rejection against the abort reason: not every browser
     // propagates the reason, and an explicit reason at least keeps "signal is aborted without
     // reason" out of the customer's console.
     const timer = natives.setTimeout(() => {
       timedOut = true;
-      controller?.abort(new Error('vinktar: request timed out'));
+      controller?.abort(new Error(TIMED_OUT));
+      expire();
     }, this.options.timeoutMs);
 
     try {
-      const bytes = typeof body === 'string' ? size : (body as Uint8Array).byteLength;
+      const headers: Record<string, string> = { 'Content-Type': 'application/json', 'X-Vinktar-Key': this.options.writeKey };
+      let body: BodyInit = out.body;
+      let bytes = byteLength(out.body);
+
+      if (gzip && this.canCompress && bytes >= GZIP_THRESHOLD_BYTES) {
+        const compressed = await Promise.race([this.compress(out.body), deadline]);
+        if (compressed !== null) {
+          body = compressed as BodyInit;
+          bytes = compressed.byteLength;
+          headers['Content-Encoding'] = 'gzip';
+        }
+      }
+
       const keepalive = bytes <= KEEPALIVE_BODY_LIMIT && this.inFlight < KEEPALIVE_MAX_INFLIGHT;
       this.inFlight += 1;
-      this.inFlightBytes += bytes;
-
       let response: Response;
       try {
-        response = await fetch(`${this.options.host}${out.endpoint}`, {
-          method: 'POST',
-          headers,
-          body,
-          keepalive,
-          credentials: 'omit',
-          mode: 'cors',
-          referrerPolicy: 'strict-origin-when-cross-origin',
-          ...(controller !== undefined ? { signal: controller.signal } : {}),
-        });
+        response = await Promise.race([
+          fetch(`${this.options.host}${out.endpoint}`, {
+            method: 'POST',
+            headers,
+            body,
+            keepalive,
+            credentials: 'omit',
+            mode: 'cors',
+            redirect: 'manual',
+            referrerPolicy: 'strict-origin-when-cross-origin',
+            ...(controller !== undefined ? { signal: controller.signal } : {}),
+          }),
+          deadline,
+        ]);
       } finally {
         this.inFlight -= 1;
-        this.inFlightBytes -= bytes;
       }
+
+      // A cross-origin redirect under `manual` is an opaque response with status 0. Report it as
+      // what it is, so it is not retried as a network failure.
+      if (response.type === 'opaqueredirect') return { status: 307, body: null };
 
       let text = '';
       try {
-        text = await response.text();
-      } catch {
+        text = await Promise.race([response.text(), deadline]);
+      } catch (error) {
+        if (timedOut) throw error;
         // An empty or unreadable body is decided on status alone.
       }
 
@@ -125,11 +148,12 @@ export class BrowserTransport implements Transport {
   }
 
   /**
-   * One attempt, synchronous, for `pagehide`. Returns whether the browser accepted the request;
-   * "accepted" is all a beacon ever says. A refusal at a body over the split floor means the
-   * payload is too big; under it, the page's beacon quota is exhausted and halving will not help.
+   * One attempt, synchronous, for `pagehide` and a hidden tab. A keepalive request that gets a 2xx
+   * while the page is still alive calls `onAccepted`; a beacon only ever says the browser took it.
+   * A refusal at a body over the split floor means the payload is too big; under it, the page's
+   * quota is exhausted and halving will not help.
    */
-  sendOnUnload(out: Outbound): 'sent' | 'too_large' | 'refused' {
+  sendOnUnload(out: Outbound, onAccepted?: () => void): UnloadResult {
     const size = byteLength(out.body);
 
     if (natives.fetch !== undefined && size <= KEEPALIVE_BODY_LIMIT && this.inFlight < KEEPALIVE_MAX_INFLIGHT) {
@@ -142,6 +166,10 @@ export class BrowserTransport implements Transport {
             keepalive: true,
             credentials: 'omit',
             mode: 'cors',
+            redirect: 'manual',
+          })
+          .then((response) => {
+            if (response.status >= 200 && response.status < 300) onAccepted?.();
           })
           .catch(() => {});
 
@@ -158,7 +186,7 @@ export class BrowserTransport implements Transport {
     try {
       const blob = new natives.Blob([out.body], { type: 'text/plain' });
       const url = `${this.options.host}${out.endpoint}?_k=${encodeURIComponent(this.options.writeKey)}`;
-      if (natives.sendBeacon(url, blob)) return 'sent';
+      if (natives.sendBeacon(url, blob)) return 'beacon';
     } catch {
       // A beacon that throws is a beacon that was refused.
     }

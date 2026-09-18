@@ -39,11 +39,16 @@ const KEY = 'vnk_pk_test_key_0001';
 const BASE = { writeKey: KEY, logger, filterBots: false } as const;
 
 describe('init', () => {
-  it('throws on a secret key and is inert without one', () => {
-    expect(() => make({ writeKey: 'vnk_sk_secret' })).toThrow(/secret key/);
-    const inert = make({ logger });
-    inert.track('x');
-    expect(lines.some((l) => l.includes('no write key'))).toBe(true);
+  it('is inert with a secret key and without a key, and says so once at error level', async () => {
+    for (const [options, said] of [[{ writeKey: 'vnk_sk_secret' }, /secret key/], [{}, /no write key/]] as const) {
+      const errors: string[] = [];
+      const inert = make({ ...options, logger: (level, message) => void (level === 'error' && errors.push(message)) });
+      inert.track('x');
+      inert.captureException(new Error('x'));
+      expect(await inert.flush()).toBe(true);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toMatch(said);
+    }
     expect(harness.requests).toHaveLength(0);
   });
 

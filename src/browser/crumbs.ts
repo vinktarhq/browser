@@ -2,6 +2,7 @@ import type { Breadcrumb } from '../core/breadcrumbs.js';
 import { truncateToBytes } from '../core/bytes.js';
 import type { Logger } from '../core/logger.js';
 import { matches } from '../core/filters.js';
+import { safeString } from '../core/guard.js';
 import type { Instrumentation } from './instrument.js';
 import { natives } from './natives.js';
 import type { Navigation } from './navigation.js';
@@ -19,6 +20,12 @@ import type { Navigation } from './navigation.js';
  * `X-Vinktar-Session-Id` are added to requests whose origin the application listed, so a server
  * SDK can stitch its events and errors to this visit. Only listed origins, ever: a header on a
  * request to a third party would trigger a CORS preflight that party never agreed to.
+ *
+ * Every wrapper here is transparent. The original is called once, with the caller's own arguments
+ * (the identity headers are the one addition), and the caller gets what it returned or threw:
+ * `fetch(undefined)` stays a rejected promise, `xhr.open('GET', undefined)` stays a request for
+ * "undefined". What the SDK does around the call sits in a `try` of its own, so a value it cannot
+ * read costs a breadcrumb and never a request.
  */
 export interface CrumbSources {
   readonly console: boolean;
@@ -64,7 +71,7 @@ function installConsole(instrumentation: Instrumentation, options: CrumbOptions)
   if (target === undefined) return;
 
   for (const level of CONSOLE_LEVELS) {
-    instrumentation.patch(target, level, (original) => {
+    const wrap = (original: Console[typeof level]): Console[typeof level] => {
       return function patched(this: Console, ...args: unknown[]) {
         if (!options.logger.isReentrant) {
           try {
@@ -80,7 +87,8 @@ function installConsole(instrumentation: Instrumentation, options: CrumbOptions)
 
         return original.apply(this, args as never[]);
       } as Console[typeof level];
-    });
+    };
+    instrumentation.patch(target, level, wrap, `console.${level}`);
   }
 }
 
@@ -96,7 +104,7 @@ export function formatArgs(args: readonly unknown[]): string {
       } catch {
         parts.push('[object]');
       }
-    } else parts.push(String(arg));
+    } else parts.push(safeString(arg));
   }
 
   return parts.join(' ');
@@ -105,61 +113,60 @@ export function formatArgs(args: readonly unknown[]): string {
 function installFetch(instrumentation: Instrumentation, options: CrumbOptions): void {
   const win = natives.window!;
   instrumentation.patch(win, 'fetch', (original) => {
-    return function patched(this: unknown, input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-      let url = '';
-      let method = 'GET';
+    return function patched(this: unknown, ...args: Parameters<typeof fetch>): Promise<Response> {
+      let call = args;
+      let done: ((status: number | string) => void) | undefined;
       try {
-        url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-        method = (init?.method ?? (typeof input === 'object' && 'method' in input ? input.method : 'GET')).toUpperCase();
-      } catch {
-        // Unusual inputs are passed through untouched.
-      }
-
-      const absolute = resolveUrl(url);
-      if (absolute === '' || absolute.startsWith(options.ingestHost)) return original.call(this, input, init);
-
-      let request = init;
-      if (shouldPropagate(absolute, options.propagateTo)) {
-        try {
-          const { deviceId, sessionId } = options.identity();
-          const headers = new Headers(init?.headers ?? (typeof input === 'object' && 'headers' in input ? input.headers : undefined));
-          headers.set('X-Vinktar-Device-Id', deviceId);
-          headers.set('X-Vinktar-Session-Id', sessionId);
-          request = { ...init, headers };
-        } catch {
-          request = init;
+        const [input, init] = args;
+        const request = typeof input === 'object' && input !== null && !(input instanceof URL) ? input : undefined;
+        const url = resolveUrl(typeof input === 'string' ? input : input instanceof URL ? input.href : safeText(request?.url));
+        if (url !== '' && !url.startsWith(options.ingestHost)) {
+          if (shouldPropagate(url, options.propagateTo)) {
+            const { deviceId, sessionId } = options.identity();
+            const headers = new Headers(init?.headers ?? request?.headers);
+            headers.set('X-Vinktar-Device-Id', deviceId);
+            headers.set('X-Vinktar-Session-Id', sessionId);
+            call = [input, { ...init, headers }];
+          }
+          if (options.sources.network) {
+            const method = safeText(init?.method ?? request?.method, 'GET').toUpperCase();
+            const shown = stripUrl(url, options.sendDefaultPii);
+            const started = Date.now();
+            done = (status) =>
+              options.add({
+                category: 'http',
+                message: `${method} ${shown}`,
+                data: { method, url: shown, status, duration_ms: Date.now() - started },
+                ...(typeof status === 'number' && status >= 400 ? { level: 'error' as const } : {}),
+              });
+          }
         }
+      } catch {
+        // Not a request this can describe, or headers it cannot add to: it goes through as it came.
+        call = args;
       }
+      if (done === undefined) return original.apply(this, call);
+      const finish = quiet(done);
 
-      if (!options.sources.network) return original.call(this, input, request);
-
-      const started = Date.now();
-      const done = (status: number | string): void => {
-        options.add({
-          category: 'http',
-          message: `${method} ${stripUrl(absolute, options.sendDefaultPii)}`,
-          data: { method, url: stripUrl(absolute, options.sendDefaultPii), status, duration_ms: Date.now() - started },
-          ...(typeof status === 'number' && status >= 400 ? { level: 'error' as const } : {}),
-        });
-      };
-
-      let promise: Promise<Response>;
+      let result: Promise<Response>;
       try {
-        promise = original.call(this, input, request);
+        result = original.apply(this, call);
       } catch (error) {
         // A wrapper further down threw synchronously. Record it, then surface it exactly as thrown.
-        done('error');
+        finish('error');
         throw error;
       }
+      // An earlier wrapper may return something that is not a promise. It is the page's either way.
+      if (!isThenable(result)) return result;
 
-      return promise.then(
+      return result.then(
         (response) => {
-          done(response.status);
+          finish(statusOf(response));
 
           return response;
         },
         (error: unknown) => {
-          done('error');
+          finish('error');
           throw error;
         },
       );
@@ -173,46 +180,101 @@ function installXhr(instrumentation: Instrumentation, options: CrumbOptions): vo
   const proto = XHR.prototype;
   const META = '__vinktar_xhr__';
 
-  instrumentation.patch(proto, 'open', (original) => {
-    return function patched(this: XMLHttpRequest, ...args: Parameters<XMLHttpRequest['open']>) {
-      const [method, url] = args;
-      const absolute = resolveUrl(typeof url === 'string' ? url : url.href);
-      (this as unknown as Record<string, unknown>)[META] = { method: String(method).toUpperCase(), url: absolute, started: 0 };
+  instrumentation.patch(
+    proto,
+    'open',
+    (original) => {
+      return function patched(this: XMLHttpRequest, ...args: Parameters<XMLHttpRequest['open']>) {
+        try {
+          const [method, url] = args;
+          // The browser coerces whatever it is given; so does this, for the breadcrumb only.
+          const absolute = resolveUrl(typeof url === 'string' ? url : safeString(url));
+          (this as unknown as Record<string, unknown>)[META] = { method: safeString(method).toUpperCase(), url: absolute, started: 0 };
+        } catch {
+          // The request opens without a breadcrumb.
+        }
 
-      return original.apply(this, args);
-    } as XMLHttpRequest['open'];
-  });
+        return original.apply(this, args);
+      } as XMLHttpRequest['open'];
+    },
+    'XMLHttpRequest.open',
+  );
 
-  instrumentation.patch(proto, 'send', (original) => {
-    return function patched(this: XMLHttpRequest, body?: Document | XMLHttpRequestBodyInit | null) {
-      const meta = (this as unknown as Record<string, unknown>)[META] as { method: string; url: string; started: number } | undefined;
-      if (meta !== undefined && meta.url !== '' && !meta.url.startsWith(options.ingestHost)) {
-        if (shouldPropagate(meta.url, options.propagateTo)) {
-          try {
-            const { deviceId, sessionId } = options.identity();
-            this.setRequestHeader('X-Vinktar-Device-Id', deviceId);
-            this.setRequestHeader('X-Vinktar-Session-Id', sessionId);
-          } catch {
-            // Already sent, or a header the browser refuses: the request goes without it.
+  instrumentation.patch(
+    proto,
+    'send',
+    (original) => {
+      return function patched(this: XMLHttpRequest, ...args: Parameters<XMLHttpRequest['send']>) {
+        try {
+          const meta = (this as unknown as Record<string, unknown>)[META] as { method: string; url: string; started: number } | undefined;
+          if (meta !== undefined && meta.url !== '' && !meta.url.startsWith(options.ingestHost)) {
+            if (shouldPropagate(meta.url, options.propagateTo)) {
+              try {
+                const { deviceId, sessionId } = options.identity();
+                this.setRequestHeader('X-Vinktar-Device-Id', deviceId);
+                this.setRequestHeader('X-Vinktar-Session-Id', sessionId);
+              } catch {
+                // Already sent, or a header the browser refuses: the request goes without it.
+              }
+            }
+            if (options.sources.network) {
+              meta.started = Date.now();
+              this.addEventListener(
+                'loadend',
+                quiet(() => {
+                  const status = this.status;
+                  options.add({
+                    category: 'http',
+                    message: `${meta.method} ${stripUrl(meta.url, options.sendDefaultPii)}`,
+                    data: { method: meta.method, url: stripUrl(meta.url, options.sendDefaultPii), status, duration_ms: Date.now() - meta.started },
+                    ...(status === 0 || status >= 400 ? { level: 'error' as const } : {}),
+                  });
+                }),
+              );
+            }
           }
+        } catch {
+          // The request is sent without a breadcrumb.
         }
-        if (options.sources.network) {
-          meta.started = Date.now();
-          this.addEventListener('loadend', () => {
-            const status = this.status;
-            options.add({
-              category: 'http',
-              message: `${meta.method} ${stripUrl(meta.url, options.sendDefaultPii)}`,
-              data: { method: meta.method, url: stripUrl(meta.url, options.sendDefaultPii), status, duration_ms: Date.now() - meta.started },
-              ...(status === 0 || status >= 400 ? { level: 'error' as const } : {}),
-            });
-          });
-        }
-      }
 
-      return original.call(this, body);
-    } as XMLHttpRequest['send'];
-  });
+        return original.apply(this, args);
+      } as XMLHttpRequest['send'];
+    },
+    'XMLHttpRequest.send',
+  );
+}
+
+/** `fn`, for a place where what it throws would land in the page: a listener, a promise handler. */
+function quiet<A extends unknown[]>(fn: (...args: A) => void): (...args: A) => void {
+  return (...args) => {
+    try {
+      fn(...args);
+    } catch {
+      // A breadcrumb must never reach the request it describes.
+    }
+  };
+}
+
+function safeText(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+function isThenable(value: unknown): boolean {
+  try {
+    return typeof (value as PromiseLike<unknown> | null | undefined)?.then === 'function';
+  } catch {
+    return false;
+  }
+}
+
+function statusOf(response: unknown): number | string {
+  try {
+    const status = (response as { status?: unknown } | null | undefined)?.status;
+
+    return typeof status === 'number' ? status : 'unknown';
+  } catch {
+    return 'unknown';
+  }
 }
 
 function installClicks(instrumentation: Instrumentation, options: CrumbOptions): void {
@@ -268,11 +330,23 @@ function selectorFor(element: Element): string {
   const classes = typeof element.className === 'string' ? element.className.split(/\s+/).filter(Boolean).slice(0, 3) : [];
   for (const cls of classes) out += `.${cls}`;
   for (const attr of ['name', 'type', 'role', 'aria-label']) {
-    const value = element.getAttribute(attr);
+    const value = attribute(element, attr);
     if (value !== null && value !== '') out += `[${attr}="${truncateToBytes(value, 32)}"]`;
   }
 
   return out;
+}
+
+/**
+ * An attribute, read through the prototype. A form control named `getAttribute` (or `id`, or
+ * `action`) replaces that property on its form, and the form's own method is then an `<input>`.
+ */
+export function attribute(element: Element, name: string): string | null {
+  try {
+    return Element.prototype.getAttribute.call(element, name);
+  } catch {
+    return null;
+  }
 }
 
 export function resolveUrl(url: string): string {

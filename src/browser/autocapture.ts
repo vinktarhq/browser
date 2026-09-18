@@ -1,5 +1,5 @@
 import type { Props } from '../core/normalize.js';
-import { describeElement, eventTarget, stripUrl } from './crumbs.js';
+import { attribute, describeElement, eventTarget, resolveUrl, stripUrl } from './crumbs.js';
 import type { Instrumentation } from './instrument.js';
 import { natives } from './natives.js';
 
@@ -38,7 +38,8 @@ export function installAutocapture(instrumentation: Instrumentation, options: Au
           $element: element.tagName.toLowerCase(),
           $selector: describeElement(element),
         };
-        if (element.id) props['$element_id'] = element.id;
+        const id = attribute(element, 'id');
+        if (id) props['$element_id'] = id;
         const href = element instanceof HTMLAnchorElement ? element.href : null;
         if (href) props['$href'] = stripUrl(href, options.sendDefaultPii);
         options.track('$autocapture', props);
@@ -58,12 +59,16 @@ export function installAutocapture(instrumentation: Instrumentation, options: Au
           $event_type: 'submit',
           $element: 'form',
           $selector: describeElement(form),
-          $form_method: (form.getAttribute('method') ?? 'get').toLowerCase(),
+          $form_method: (attribute(form, 'method') ?? 'get').toLowerCase(),
         };
-        if (form.name) props['$form_name'] = form.name;
-        if (form.id) props['$form_id'] = form.id;
-        const action = form.getAttribute('action');
-        if (action) props['$form_action'] = stripUrl(new URL(action, natives.window?.location.href).href, options.sendDefaultPii);
+        // Attributes, not properties: a control named `name`, `id` or `action` shadows the property.
+        const name = attribute(form, 'name');
+        if (name) props['$form_name'] = name;
+        const id = attribute(form, 'id');
+        if (id) props['$form_id'] = id;
+        const action = attribute(form, 'action');
+        // An action that is not a URL is recorded as written.
+        if (action) props['$form_action'] = stripUrl(resolveUrl(action), options.sendDefaultPii);
         options.track('$autocapture', props);
       },
       { capture: true, passive: true },

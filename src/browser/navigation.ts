@@ -56,14 +56,23 @@ export class Navigation {
     };
 
     for (const method of ['pushState', 'replaceState'] as const) {
-      this.instrumentation.patch(win.history, method, (original) => {
-        return function patched(this: History, ...args: Parameters<History['pushState']>) {
-          const result = original.apply(this, args);
-          emit(method);
+      this.instrumentation.patch(
+        win.history,
+        method,
+        (original) => {
+          return function patched(this: History, ...args: Parameters<History['pushState']>) {
+            const result = original.apply(this, args);
+            try {
+              emit(method);
+            } catch {
+              // The navigation happened. Only the SDK's notice of it is lost.
+            }
 
-          return result;
-        } as History['pushState'];
-      });
+            return result;
+          } as History['pushState'];
+        },
+        `history.${method}`,
+      );
     }
     this.instrumentation.listen(win, 'popstate', () => emit('popstate'));
     this.instrumentation.listen(win, 'hashchange', () => emit('hashchange'));

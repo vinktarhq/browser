@@ -26,12 +26,16 @@ export function installGlobalHandlers(instrumentation: Instrumentation, onError:
   if (win === undefined) return;
 
   const ErrorCtor = win.Error as ErrorConstructor & { stackTraceLimit?: number };
-  if (typeof ErrorCtor.stackTraceLimit === 'number' && ErrorCtor.stackTraceLimit < 50) {
-    const previous = ErrorCtor.stackTraceLimit;
-    ErrorCtor.stackTraceLimit = 50;
-    instrumentation.onTeardown(() => {
-      ErrorCtor.stackTraceLimit = previous;
-    });
+  try {
+    if (typeof ErrorCtor.stackTraceLimit === 'number' && ErrorCtor.stackTraceLimit < 50) {
+      const previous = ErrorCtor.stackTraceLimit;
+      ErrorCtor.stackTraceLimit = 50;
+      instrumentation.onTeardown(() => {
+        ErrorCtor.stackTraceLimit = previous;
+      });
+    }
+  } catch {
+    // A frozen `Error` keeps its limit, and stacks stay as short as the page wants them.
   }
 
   instrumentation.listen(win, 'error', (event) => {

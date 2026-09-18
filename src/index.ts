@@ -3,6 +3,7 @@ import type { Breadcrumb, Props, Traits } from './types.js';
 import type { CaptureContext, IdentifyOptions, Scope, User } from './types.js';
 import type { VinktarOptions } from './options.js';
 import { natives } from './browser/natives.js';
+import { safeString, show } from './core/guard.js';
 
 /**
  * The module-level facade: one default client, and a function per method that forwards to it.
@@ -11,6 +12,10 @@ import { natives } from './browser/natives.js';
  * once it runs, so a `track()` fired from an early script or an `identify()` in a layout is not
  * lost to load order. A second `init()` warns and returns the first client; two clients on one
  * page would each patch the same globals.
+ *
+ * Every function here forwards to a client method, and those never throw. `init()` does not throw
+ * either: options it cannot use, a missing or a secret key included, leave an inert client and a
+ * logged line.
  */
 export { Vinktar } from './client.js';
 export { VERSION, LIB } from './version.js';
@@ -32,7 +37,14 @@ export function init(options: VinktarOptions = {}): Vinktar {
 
     return client;
   }
-  client = new Vinktar(options);
+  try {
+    client = new Vinktar(options);
+  } catch (error) {
+    // The constructor guards everything it does. Should something get past that, the page still
+    // gets a client, one that does nothing.
+    natives.console.error(`[vinktar] init() failed, so nothing will be sent: ${safeString(error)}`);
+    client = new Vinktar({ enabled: false, logger: () => {} });
+  }
   for (const [method, args] of pending.splice(0)) {
     (client as unknown as Record<string, (...a: unknown[]) => unknown>)[method]?.(...args);
   }
@@ -125,6 +137,11 @@ export function setContext(context: Props | null): void {
 
 export function withScope<T>(work: (scope: Scope) => T): T {
   if (client !== null) return client.withScope(work);
+  if (typeof work !== 'function') {
+    natives.console.warn(`[vinktar] withScope() needs a function to run, not ${show(work)}; nothing was run`);
+
+    return undefined as T;
+  }
   // Without a client there is no scope to fork; the work still runs.
   const noop: Scope = { setTag: () => {}, setTags: () => {}, setContext: () => {} };
 

@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.3.0
+
+The SDK must never break the page it is installed in, whatever it is handed. This release closes
+the places where it could, and changes what `init()` does with a key it cannot use: read "Changed".
+
+### Changed
+
+- `init()` never throws. Given a secret key (`vnk_sk_…`) it used to throw a `TypeError`; it now
+  logs one error telling you to rotate the key, does not keep the key, and leaves the client inert.
+  A missing key is logged at error level instead of as a warning. Either way `flush()` and
+  `close()` resolve `true` and nothing is sent, exactly as with `enabled: false`.
+- `withScope()` given anything but a function logs a warning and returns `undefined`. It used to
+  throw a `TypeError`. What your callback throws still goes straight back to you.
+- Entries of `ignoreErrors`, `denyUrls`, `allowUrls` and `propagateIdentity` that are neither a
+  string nor a `RegExp` are dropped with a warning, and so are entries of `redactedKeys`,
+  `propertyDenylist` and `enabledEnvironments` that are not strings. A `null` in `redactedKeys`
+  used to become the fragment `"null"`.
+- The bundle is about 1 kB larger.
+
+### Fixed
+
+- `propagateIdentity: [undefined]` (or any entry that is not a pattern) made every `fetch` and
+  every `XMLHttpRequest.send` on the page throw.
+- The `fetch` and `XMLHttpRequest` wrappers call the original with exactly the arguments they were
+  given and fail the way the browser does: `fetch(undefined)` is a rejected promise again, not a
+  synchronous `TypeError`, and `xhr.open('GET', undefined)` no longer throws. A wrapper further
+  down that returns something other than a promise of a `Response` gets it handed back untouched.
+- `init(null)`, and options whose getters throw, no longer throw. Each option is read once, and one
+  that cannot be read is ignored with a warning.
+- A global that cannot be patched (a frozen `console`, a read-only `window.fetch`, a frozen
+  `Error`) is skipped with a warning. It used to make `init()` throw and leave the patches made
+  before it installed with nothing to remove them.
+- `page()` with properties that are not an object threw, including when replayed from calls made
+  before `init()`.
+- A form whose `action` is not a valid URL threw from the submit listener, and a form control
+  named `getAttribute`, `id`, `name` or `action` broke autocapture and click breadcrumbs for that
+  form. Every listener the SDK adds now runs inside a `try`.
+- A property whose getter throws costs that property, recorded as `[Unreadable]`, instead of the
+  whole event. Normalising is bounded by the number of values visited as well as by depth, so a
+  very wide object cannot stall `track()`.
+- `flush()` and `close()` always resolve; a failure inside them is `false`, never a rejection.
+- The module imports in a runtime without `TextEncoder`.
+
 ## 0.2.0
 
 Delivery results could report success for data the server never kept, and several failure paths

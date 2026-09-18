@@ -1,6 +1,7 @@
 import * as facade from './index.js';
 import type { VinktarOptions } from './options.js';
 import { natives } from './browser/natives.js';
+import { safeString } from './core/guard.js';
 
 /**
  * The CDN build's entry point: `window.vinktar`.
@@ -31,14 +32,12 @@ function install(): void {
   if (script !== null && !initInQueue) facade.init(optionsFromAttributes(script));
 
   for (const call of queued) {
-    const [method, ...args] = call;
-    const fn = (api as Record<string, unknown>)[String(method)];
-    if (typeof fn === 'function') {
-      try {
-        (fn as (...a: unknown[]) => unknown)(...args);
-      } catch {
-        // A queued call that throws must not stop the ones after it.
-      }
+    try {
+      const [method, ...args] = call;
+      const fn = (api as Record<string, unknown>)[safeString(method)];
+      if (typeof fn === 'function') (fn as (...a: unknown[]) => unknown)(...args);
+    } catch {
+      // A queued call that throws, or an entry that is not a call, must not stop the ones after it.
     }
   }
 }
@@ -88,4 +87,9 @@ export function optionsFromAttributes(script: Element): VinktarOptions {
   return options as VinktarOptions;
 }
 
-install();
+// A script tag cannot be wrapped in a `try` by the page that includes it.
+try {
+  install();
+} catch (error) {
+  natives.console.error(`[vinktar] the bundle failed to start, so nothing will be sent: ${safeString(error)}`);
+}

@@ -15,6 +15,7 @@ import { Dedupe, KeyedValve, Valve } from './core/dedupe.js';
 import { Dispatcher, type Endpoint } from './core/dispatcher.js';
 import { coerce, CORE_COERCERS, exceptionKey, fromMessage, isMeaningless, issueKey, type WireException } from './core/exception.js';
 import { crashFile, DEFAULT_IGNORE, isServerSuppressed, matches } from './core/filters.js';
+import { attempt, isObject, safeString, show } from './core/guard.js';
 import { runHooks } from './core/hooks.js';
 import { hexId, uuidv7 } from './core/ids.js';
 import { MAX_FINGERPRINT_PART_BYTES, MAX_FINGERPRINT_PARTS, MAX_PROPERTIES_PER_EVENT, MAX_TAG_KEY_BYTES, MAX_TAG_VALUE_BYTES, MAX_TAGS, type Level } from './core/limits.js';
@@ -26,7 +27,7 @@ import { sampled } from './core/sampling.js';
 import { parseStack, syntheticFrame } from './core/stack.js';
 import { describeTraitDrop, parseTraits, type Traits } from './core/traits.js';
 import { truncateToBytes } from './core/bytes.js';
-import { isLevel, makeLogger, resolve, type Resolved, type VinktarOptions } from './options.js';
+import { isLevel, makeLogger, readOptions, resolve, type Resolved, type VinktarOptions } from './options.js';
 import type { CaptureContext, IdentifyOptions, Integration, IntegrationHost, Scope, User } from './types.js';
 import { VERSION } from './version.js';
 
@@ -43,7 +44,10 @@ import { VERSION } from './version.js';
  *      rebind is warned about, because the server keeps the first link forever.
  *   3. **Never let the SDK become the noise.** Own requests, own console lines and own failures are
  *      invisible to breadcrumbs and error capture.
- *   4. **Never throw.** Not from a public method, not from a handler, not from a hook.
+ *   4. **Never throw.** Not from the constructor, whatever it is handed; not from a public method,
+ *      whatever its arguments; not from a handler, and not from a hook. A key that is missing, or
+ *      one the browser must not hold, leaves an inert client and one line at error level. The one
+ *      thing that passes through untouched is what the page's own callback throws in `withScope`.
  */
 const PENDING_ERRORS = 50;
 // The persisted queue shares the origin's localStorage quota (about five million characters) with
@@ -64,8 +68,8 @@ export class Vinktar {
   private readonly transport: BrowserTransport;
   private readonly persistence: QueuePersistence | null;
   private readonly crumbs: Breadcrumbs;
-  private readonly instrumentation = new Instrumentation();
-  private readonly navigation = new Navigation(this.instrumentation);
+  private readonly instrumentation: Instrumentation;
+  private readonly navigation: Navigation;
   private readonly dedupe = new Dedupe();
   private readonly errorValve: Valve;
   private readonly eventValve: Valve;
@@ -86,8 +90,17 @@ export class Vinktar {
   private pageMaxScroll = 0;
 
   constructor(options: VinktarOptions = {}) {
-    this.logger = makeLogger(options);
-    this.o = resolve(options, this.logger);
+    const read = readOptions(options);
+    this.logger = makeLogger(read.options);
+    for (const problem of read.problems) this.logger.warn(problem);
+    this.o =
+      attempt<Resolved | null>(() => resolve(read.options, this.logger), null, (error) =>
+        this.logger.error('the options could not be used, so nothing will be sent', { error: safeString(error) }),
+      ) ?? resolve({}, this.logger, 'the options could not be used');
+    this.instrumentation = new Instrumentation((what) =>
+      this.logger.warn(`${what} cannot be patched here (it is frozen or read-only), so the SDK does not observe it`),
+    );
+    this.navigation = new Navigation(this.instrumentation);
     this.inert = this.o.inert;
     if (!hasDom) this.inert ??= 'no window: nothing to observe here';
     this.tags = { ...this.o.initialScope.tags };
@@ -151,6 +164,12 @@ export class Vinktar {
 
     if (this.inert !== null) return;
 
+    // Everything below reaches into the page: storage, globals, listeners. A page that refuses one
+    // of them costs that feature, never the constructor.
+    this.guarded(() => this.start());
+  }
+
+  private start(): void {
     this.supers = (parseJson(this.stores.data.get(this.keys.sup)) as Props | undefined) ?? {};
     const attribution = initialAttribution(this.stores.data, this.keys.attr, this.o.sendDefaultPii);
     for (const [key, value] of Object.entries(attribution)) this.supers[key] ??= value;
@@ -267,7 +286,7 @@ export class Vinktar {
       const teardown = integration.setup(host);
       if (typeof teardown === 'function') this.teardowns.push(teardown);
     } catch (error) {
-      this.logger.warn(`integration "${integration.name}" failed to set up and was skipped`, { error: String(error) });
+      this.logger.warn(`integration ${show(attempt(() => integration.name, undefined))} failed to set up and was skipped`, { error: safeString(error) });
     }
   }
 
@@ -305,7 +324,7 @@ export class Vinktar {
 
       const context = normalize(pageContext(this.o), this.normalizeOptions);
       const payload = normalize(
-        { ...this.o.superProperties, ...this.supers, ...(typeof properties === 'object' && properties !== null ? properties : {}) },
+        { ...this.o.superProperties, ...this.supers, ...(isObject(properties) ? properties : {}) },
         this.normalizeOptions,
         (key, reason) => this.logger.warn(`property "${key}" on "${name}" was ${reason === 'truncated' ? 'truncated' : reason === 'depth' ? 'flattened past depth ' + this.o.normalizeDepth : 'dropped: too many properties'}`),
       );
@@ -323,7 +342,7 @@ export class Vinktar {
       const hooked = runHooks(this.o.beforeTrack, event);
       if (hooked.value === null) {
         this.drop('before_send', 'event');
-        if (hooked.threw !== undefined) this.logger.warn('beforeTrack threw; the event was dropped', { error: String(hooked.threw) });
+        if (hooked.threw !== undefined) this.logger.warn('beforeTrack threw; the event was dropped', { error: safeString(hooked.threw) });
 
         return;
       }
@@ -340,13 +359,15 @@ export class Vinktar {
   }
 
   page(name?: string, properties?: Props): void {
-    const props: Props = { ...(properties ?? {}) };
-    if (typeof name === 'string' && name !== '') props['$page_name'] = name;
-    if (this.o.autoPageviews.leave) {
-      this.pageStarted = Date.now();
-      this.pageMaxScroll = 0;
-    }
-    this.track('$pageview', props);
+    this.guarded(() => {
+      const props: Props = { ...(isObject(properties) ? properties : {}) };
+      if (typeof name === 'string' && name !== '') props['$page_name'] = name;
+      if (this.o.autoPageviews.leave) {
+        this.pageStarted = Date.now();
+        this.pageMaxScroll = 0;
+      }
+      this.track('$pageview', props);
+    });
   }
 
   identify(userId: string, traits?: Traits, traitsOnce?: Traits, options?: IdentifyOptions): void {
@@ -354,7 +375,7 @@ export class Vinktar {
       if (!this.ready('identify')) return;
       const id = validUserId(userId);
       if (id === null) {
-        this.logger.warn(`identify(${JSON.stringify(userId)}) was ignored: not a usable user id`);
+        this.logger.warn(`identify(${show(userId)}) was ignored: not a usable user id`);
 
         return;
       }
@@ -422,7 +443,7 @@ export class Vinktar {
 
         return;
       }
-      if (typeof user !== 'object' || typeof user.id !== 'string') {
+      if (!isObject(user) || typeof user.id !== 'string') {
         this.logger.warn('setUser() needs { id } or null');
 
         return;
@@ -452,7 +473,7 @@ export class Vinktar {
 
   register(properties: Props): void {
     this.guarded(() => {
-      if (typeof properties !== 'object' || properties === null) return;
+      if (!isObject(properties)) return;
       Object.assign(this.supers, properties);
       this.saveSupers();
     });
@@ -460,7 +481,7 @@ export class Vinktar {
 
   registerOnce(properties: Props): void {
     this.guarded(() => {
-      if (typeof properties !== 'object' || properties === null) return;
+      if (!isObject(properties)) return;
       for (const [key, value] of Object.entries(properties)) this.supers[key] ??= value;
       this.saveSupers();
     });
@@ -468,6 +489,7 @@ export class Vinktar {
 
   unregister(key: string): void {
     this.guarded(() => {
+      if (typeof key !== 'string') return;
       delete this.supers[key];
       this.saveSupers();
     });
@@ -487,7 +509,7 @@ export class Vinktar {
   captureMessage(message: string, hint?: CaptureContext): string {
     return this.guarded(() => {
       if (!this.ready('captureMessage')) return '';
-      const text = typeof message === 'string' ? message : String(message);
+      const text = typeof message === 'string' ? message : safeString(message);
       let frames = this.o.attachStacktrace ? parseStack(new Error().stack) : [];
       // Crash-last: the last two frames are this method and its caller inside the facade.
       if (frames.length > 2) frames = frames.slice(0, -2);
@@ -617,13 +639,13 @@ export class Vinktar {
     const crumbs = this.crumbs.list();
     if (crumbs.length > 0) event['breadcrumbs'] = crumbs;
     if (Array.isArray(hint.fingerprint) && hint.fingerprint.length > 0) {
-      event['fingerprint'] = hint.fingerprint.slice(0, MAX_FINGERPRINT_PARTS).map((part) => truncateToBytes(String(part), MAX_FINGERPRINT_PART_BYTES));
+      event['fingerprint'] = hint.fingerprint.slice(0, MAX_FINGERPRINT_PARTS).map((part) => truncateToBytes(safeString(part), MAX_FINGERPRINT_PART_BYTES));
     }
 
     const hooked = runHooks(this.o.beforeSend, event);
     if (hooked.value === null) {
       this.drop('before_send', 'error');
-      if (hooked.threw !== undefined) this.logger.warn('beforeSend threw; the error was dropped', { error: String(hooked.threw) });
+      if (hooked.threw !== undefined) this.logger.warn('beforeSend threw; the error was dropped', { error: safeString(hooked.threw) });
 
       return '';
     }
@@ -656,13 +678,13 @@ export class Vinktar {
   setTag(key: string, value: string): void {
     this.guarded(() => {
       if (typeof key !== 'string' || key === '') return;
-      this.tags[key] = String(value);
+      this.tags[key] = safeString(value);
     });
   }
 
   setTags(tags: Record<string, string>): void {
     this.guarded(() => {
-      if (typeof tags !== 'object' || tags === null) return;
+      if (!isObject(tags)) return;
       for (const [key, value] of Object.entries(tags)) this.setTag(key, value);
     });
   }
@@ -670,7 +692,7 @@ export class Vinktar {
   setContext(context: Props | null): void {
     this.guarded(() => {
       if (context === null) this.context = {};
-      else if (typeof context === 'object') Object.assign(this.context, context);
+      else if (isObject(context)) Object.assign(this.context, context);
     });
   }
 
@@ -689,9 +711,15 @@ export class Vinktar {
    * are not isolated. A page has one person at a time and no async context to hang a scope on.
    * An exception from `work` is the application's and goes straight back to it, unreported: the
    * SDK changing control flow, or reporting an error the application is about to handle, would be
-   * worse than useless.
+   * worse than useless. Anything but a function is refused with a warning, and the call returns
+   * `undefined`.
    */
   withScope<T>(work: (scope: Scope) => T): T {
+    if (typeof work !== 'function') {
+      this.logger.warn(`withScope() needs a function to run, not ${show(work)}; nothing was run`);
+
+      return undefined as T;
+    }
     const tags = { ...this.tags };
     const context = { ...this.context };
     try {
@@ -752,7 +780,11 @@ export class Vinktar {
     if (this.closing !== null) return this.closing;
     if (!this.identity.allowed) return Promise.resolve(true);
 
-    return this.flushNow();
+    return this.flushNow().catch((error: unknown) => {
+      this.failed(error);
+
+      return false;
+    });
   }
 
   /**
@@ -763,7 +795,11 @@ export class Vinktar {
   close(): Promise<boolean> {
     if (this.closing === null) {
       this.closed = true;
-      this.closing = this.shutdown();
+      this.closing = this.shutdown().catch((error: unknown) => {
+        this.failed(error);
+
+        return false;
+      });
     }
 
     return this.closing;
@@ -997,18 +1033,17 @@ export class Vinktar {
     this.track('$pageleave', { $duration_ms: duration, $scroll_depth: this.pageMaxScroll });
   }
 
+  /** Every public method's body runs in here. Whatever it throws is reported and the caller gets `fallback`. */
   private guarded<T>(fn: () => T, fallback?: T): T {
-    try {
-      return fn();
-    } catch (error) {
-      this.logger.error('internal failure', { error: String(error) });
-      try {
-        this.o.onError?.(error instanceof Error ? error : new Error(String(error)));
-      } catch {
-        // The customer's handler threw. Nothing more can be done about that here.
-      }
+    return attempt(fn, fallback as T, (error) => this.failed(error));
+  }
 
-      return fallback as T;
+  private failed(error: unknown): void {
+    this.logger.error('internal failure', { error: safeString(error) });
+    try {
+      this.o.onError?.(error instanceof Error ? error : new Error(safeString(error)));
+    } catch {
+      // The customer's handler threw. Nothing more can be done about that here.
     }
   }
 }

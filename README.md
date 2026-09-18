@@ -30,7 +30,7 @@ Or, with no build step at all:
 That is the whole setup. Pageviews are sent automatically, including single-page-app route
 changes, and uncaught errors are reported with their stack, breadcrumbs and the current user.
 
-**About 22 kB compressed. Zero runtime dependencies. Never throws into your code.** Everything
+**About 23 kB compressed. Zero runtime dependencies. Never throws into your code.** Everything
 the SDK cannot send is said out loud in the console once, never silently dropped.
 
 ---
@@ -55,8 +55,9 @@ the SDK cannot send is said out loud in the console once, never silently dropped
 
 The browser uses the project's **write key**, which starts `vnk_pk_`. It is safe to ship in a
 bundle: it can only append events to your project. A secret key (`vnk_sk_`) must never reach a
-browser, and `init()` throws if given one, because a key in a bundle is a key in every visitor's
-hands.
+browser, because a key in a bundle is a key in every visitor's hands. Given one, `init()` refuses
+to use it: it logs one error telling you to rotate the key, and the SDK stays inert. `init()`
+never throws, for this or for anything else, so a bad key cannot take your page down with it.
 
 Keys are created in the project settings.
 
@@ -251,8 +252,8 @@ Open the console. The SDK never fails silently: a missing key, an option out of 
 property, a trait the server refused, a rejected batch and a rate limit each produce one line
 that says what happened and why. `debug: true` adds the rest.
 
-The three things it is usually one of: the key is a secret key (the SDK throws) or missing (it
-says so once); an ad blocker is blocking the request (the SDK retries three times and then
+The three things it is usually one of: the key is a secret key or missing (either way the SDK
+logs one error and sends nothing); an ad blocker is blocking the request (the SDK retries three times and then
 counts the batch as a send error, which you can see in the project's client reports); or the
 page is `localhost`, which reports under the `development` environment.
 

@@ -6,6 +6,11 @@
  * while a second, unrelated instance on the page (a CDN tag next to an npm bundle) wraps on top
  * and sees the same calls. Teardown restores in reverse order, and only when nobody has patched
  * on top since, so a wrapper installed by another library is never stranded.
+ *
+ * A global that cannot be replaced (a frozen `console`, a read-only `fetch` in a hardened page) is
+ * left as it is and `onRefused` is told; the patches made before it keep working. Every listener
+ * registered here runs inside a `try`, because what a listener throws surfaces in the page, as an
+ * `error` event or out of the `dispatchEvent` call that fired it.
  */
 const TAG = '__vinktar_patched__';
 
@@ -18,14 +23,17 @@ export class Instrumentation {
   private readonly id = (instances += 1);
   private torndown = false;
 
-  /** Replace `owner[name]` with `wrap(original)`, unless it is already ours. */
-  patch<T extends object, K extends keyof T & string>(owner: T, name: K, wrap: (original: T[K]) => T[K]): void {
-    if (this.torndown) return;
-    const original = owner[name];
-    if (typeof original !== 'function' || (original as unknown as Record<string, unknown>)[TAG] === this.id) return;
+  /** @param onRefused told the name of each global that could not be patched. */
+  constructor(private readonly onRefused: (what: string) => void = () => {}) {}
 
+  /** Replace `owner[name]` with `wrap(original)`, unless it is already ours. `label` is how a refusal names it. */
+  patch<T extends object, K extends keyof T & string>(owner: T, name: K, wrap: (original: T[K]) => T[K], label: string = name): void {
+    if (this.torndown) return;
+    let original: T[K];
     let replacement: T[K];
     try {
+      original = owner[name];
+      if (typeof original !== 'function' || (original as unknown as Record<string, unknown>)[TAG] === this.id) return;
       replacement = wrap(original);
     } catch {
       return;
@@ -35,7 +43,13 @@ export class Instrumentation {
     } catch {
       // A frozen function cannot be tagged; it still works, it just cannot be recognised twice.
     }
-    owner[name] = replacement;
+    try {
+      owner[name] = replacement;
+    } catch {
+      this.onRefused(label);
+
+      return;
+    }
     this.restores.push(() => {
       // Only if nobody patched on top of us since: restoring under a later wrapper would strand it.
       if (owner[name] === replacement) owner[name] = original;
@@ -49,9 +63,16 @@ export class Instrumentation {
     options?: AddEventListenerOptions,
   ): void {
     if (this.torndown) return;
+    const guarded = (event: Event): void => {
+      try {
+        handler(event);
+      } catch {
+        // Whatever the SDK wanted from this event is lost. The page's own listeners are not.
+      }
+    };
     try {
-      target.addEventListener(type, handler, options);
-      this.restores.push(() => target.removeEventListener(type, handler, options));
+      target.addEventListener(type, guarded, options);
+      this.restores.push(() => target.removeEventListener(type, guarded, options));
     } catch {
       // A target without addEventListener (some webviews' opener) is simply not observed.
     }

@@ -52,6 +52,15 @@ describe('init', () => {
     expect(harness.requests).toHaveLength(0);
   });
 
+  it('says nothing when switched off on purpose', async () => {
+    const said: string[] = [];
+    const off = make({ enabled: false, logger: (level, message) => void said.push(`${level}: ${message}`) });
+    off.track('x');
+    expect(await off.flush()).toBe(true);
+    expect(said).toEqual([]);
+    expect(harness.requests).toHaveLength(0);
+  });
+
   it('sends the first pageview at once, on the next tick', async () => {
     sdk.init({ ...BASE });
     await tick(5);

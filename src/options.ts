@@ -361,6 +361,8 @@ export function resolve(options: VinktarOptions, logger: Logger, broken?: string
   };
 
   if (refused !== null) logger.error(refused);
+  // Switched off on purpose is a decision, not a problem: only debug output mentions it.
+  else if (!enabled && broken === undefined) logger.debug('inert: enabled is false');
   else if (inert !== null) logger.warn(`inert: ${inert}`);
 
   return resolved;

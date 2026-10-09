@@ -3,6 +3,7 @@ import { parseRetryAfter } from '../core/decide.js';
 import type { Delivery, Outbound, SendOptions, Transport } from '../core/dispatcher.js';
 import type { Logger } from '../core/logger.js';
 import { parseJson } from '../core/normalize.js';
+import { markOwn } from '../core/own.js';
 import { natives } from './natives.js';
 
 /**
@@ -29,8 +30,11 @@ import { natives } from './natives.js';
  * fifteen in flight, and the unload path falls back to `sendBeacon` otherwise.
  *
  * **Third-party code patches `fetch`**, sometimes to throw synchronously. The SDK holds the
- * pristine reference from `natives.ts` and still wraps the call, so a wrapper installed before
- * this module loaded cannot turn an analytics send into an unhandled rejection on the page.
+ * reference `natives.ts` took when it loaded and still wraps the call. That reference is only as
+ * pristine as the page was at that moment: a wrapper installed earlier is the one the SDK sends
+ * through, and if it derives a promise it never handles, a failed send becomes an unhandled
+ * rejection there. Every error made or caught here is therefore marked (`core/own.ts`), and the
+ * global handlers do not report a marked one as the application's.
  */
 export interface BrowserTransportOptions {
   readonly host: string;
@@ -67,10 +71,12 @@ export class BrowserTransport implements Transport {
 
     const controller = natives.AbortController !== undefined ? new natives.AbortController() : undefined;
     let timedOut = false;
+    const timeout = new Error(TIMED_OUT);
+    markOwn(timeout);
     let expire: () => void = () => {};
     // Raced against every await below, so a step that ignores the abort signal still ends on time.
     const deadline = new Promise<never>((_, reject) => {
-      expire = () => reject(new Error(TIMED_OUT));
+      expire = () => reject(timeout);
     });
     deadline.catch(() => {});
     // Detected by flag, not by comparing the rejection against the abort reason: not every browser
@@ -78,7 +84,7 @@ export class BrowserTransport implements Transport {
     // reason" out of the customer's console.
     const timer = natives.setTimeout(() => {
       timedOut = true;
-      controller?.abort(new Error(TIMED_OUT));
+      controller?.abort(timeout);
       expire();
     }, this.options.timeoutMs);
 
@@ -137,6 +143,7 @@ export class BrowserTransport implements Transport {
         rateLimitCategories: header(response, 'X-RateLimit-Categories') ?? '',
       };
     } catch (error) {
+      markOwn(error);
       const message = error instanceof Error ? error.message : String(error);
       // Ad blockers, offline devices and CORS failures all surface as one generic TypeError with a
       // browser-specific message. Logged at debug, not warn: a transport failure of the SDK's own
@@ -180,7 +187,7 @@ export class BrowserTransport implements Transport {
           .then((response) => {
             if (response.status >= 200 && response.status < 300) onAccepted?.();
           })
-          .catch(() => {});
+          .catch(markOwn);
 
         return 'sent';
       } catch {
@@ -213,6 +220,7 @@ export class BrowserTransport implements Transport {
 
       return new Uint8Array(buffer);
     } catch (error) {
+      markOwn(error);
       // Latched: a runtime whose CompressionStream is broken is broken for the rest of the page,
       // and every request would otherwise pay to find that out again.
       this.gzipBroken = true;

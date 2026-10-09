@@ -1,6 +1,6 @@
 {
   "name": "@vinktarhq/browser",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Vinktar for the browser: product analytics and error tracking in one small bundle.",
   "keywords": [
     "vinktar",

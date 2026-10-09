@@ -208,6 +208,40 @@ describe('errors', () => {
     await client.close();
   });
 
+  it('does not report its own failed request when a fetch wrapper lets the rejection escape', async () => {
+    // The page as a storefront hands it over: `fetch` already wrapped by another script, which
+    // derives a promise from every call and never handles it. The browser then raises the
+    // rejection on the window with the very reason the SDK aborted its request with.
+    const sent: string[] = [];
+    let stalled = false;
+    vi.stubGlobal('fetch', (input: string, init: RequestInit) => {
+      sent.push(input);
+      if (stalled) return Promise.resolve(new Response(JSON.stringify({ received: 1, rejected: 0, errors: [] }), { status: 202 }));
+      stalled = true;
+      const call = new Promise<Response>((_, reject) => init.signal!.addEventListener('abort', () => reject(init.signal!.reason)));
+      call.then(undefined, (reason) => window.dispatchEvent(Object.assign(new Event('unhandledrejection'), { reason })));
+
+      return call;
+    });
+    vi.resetModules();
+    sdk = await import('../src/index.js');
+
+    const client = make({ ...BASE, autoPageviews: false, requestTimeoutMs: 1_000 });
+    client.track('button_clicked');
+    await client.flush();
+    await tick(50);
+    await client.flush();
+
+    expect(sent.some((url) => url.includes('/v1/batch'))).toBe(true);
+    expect(sent.filter((url) => url.includes('/v1/errors'))).toEqual([]);
+
+    // The same words thrown by the application are the application's, and are reported.
+    window.dispatchEvent(Object.assign(new Event('unhandledrejection'), { reason: new Error('vinktar: request timed out') }));
+    await client.flush();
+    expect(sent.filter((url) => url.includes('/v1/errors'))).toHaveLength(1);
+    await client.close();
+  });
+
   it('dedupes, ignores and filters by URL', async () => {
     const client = make({ ...BASE, autoPageviews: false, ignoreErrors: [/ignored/], denyUrls: ['cdn.third.party'] });
     const err = new Error('same');

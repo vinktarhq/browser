@@ -21,6 +21,7 @@ import { hexId, uuidv7 } from './core/ids.js';
 import { MAX_FINGERPRINT_PART_BYTES, MAX_FINGERPRINT_PARTS, MAX_PROPERTIES_PER_EVENT, MAX_TAG_KEY_BYTES, MAX_TAG_VALUE_BYTES, MAX_TAGS, type Level } from './core/limits.js';
 import type { Logger } from './core/logger.js';
 import { capCombined, normalize, normalizeTags, parseJson, type NormalizeOptions, type Props } from './core/normalize.js';
+import { isOwn } from './core/own.js';
 import type { Entry } from './core/queue.js';
 import type { Category, DropReason } from './core/reports.js';
 import { sampled } from './core/sampling.js';
@@ -523,6 +524,12 @@ export class Vinktar {
   private captureGlobal(value: unknown, mechanism: GlobalMechanism, location?: { file: string; line: number; col: number }): void {
     this.guarded(() => {
       if (isMeaningless(value)) return;
+      // The SDK's own request failing inside somebody else's `fetch` wrapper: not the page's error.
+      if (isOwn(value)) {
+        this.logger.debug('not reported: a failure of the SDK\'s own request', { mechanism });
+
+        return;
+      }
       this.capture(value, mechanism, false, undefined, location);
     });
   }

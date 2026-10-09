@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The SDK no longer reports the failure of its own request as an error of the page. On a page
+  where another script had wrapped `fetch` before the SDK loaded, a request the SDK timed out (or
+  one that failed on the network, or while compressing) could surface as an unhandled rejection
+  from that wrapper, and the SDK captured it: `vinktar: request timed out`, unhandled, in the
+  customer's issues. Errors the SDK makes or catches while sending are now recognised by identity
+  and left out; an application error that happens to read the same is still reported.
+
 ## 0.3.1
 
 - A client switched off with `enabled: false` no longer logs `inert: enabled is false` as a

@@ -11,6 +11,8 @@ Pageviews, events and identities on one side; uncaught errors, rejections and th
 that led to them on the other. Both go to [Vinktar](https://vinktar.com) over one connection,
 with one identity, so an error can be read next to what the person was doing.
 
+The setup guide, and how to check that data arrives: [vinktar.com/docs/install/browser](https://vinktar.com/docs/install/browser).
+
 ```ts
 import { init, track, identify, captureException } from '@vinktarhq/browser';
 

@@ -252,10 +252,26 @@ describe('errors', () => {
     const third = new Error('from a cdn');
     third.stack = 'Error: x\n    at f (https://cdn.third.party/w.js:1:1)';
     client.captureException(third);
-    client.captureException(new Error('Script error.'));
     await client.flush();
     expect(harness.errors()).toHaveLength(1);
     await client.close();
+  });
+
+  it('sends known noise unless ignoreKnownNoise is on', async () => {
+    const sending = make({ ...BASE, autoPageviews: false });
+    sending.captureException(new Error('Script error.'));
+    sending.captureException(new Error('ResizeObserver loop completed with undelivered notifications'));
+    await sending.flush();
+    expect(harness.errors()).toHaveLength(2);
+    await sending.close();
+
+    harness.reset();
+    const ignoring = make({ ...BASE, autoPageviews: false, ignoreKnownNoise: true });
+    ignoring.captureException(new Error('Script error.'));
+    ignoring.captureException(new Error('Cannot redefine property: ethereum'));
+    await ignoring.flush();
+    expect(harness.errors()).toHaveLength(0);
+    await ignoring.close();
   });
 
   it('carries breadcrumbs from console and clicks, never the SDK\'s own lines', async () => {

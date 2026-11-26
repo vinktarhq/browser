@@ -14,7 +14,7 @@ import { validUserId } from './core/blocked.js';
 import { Dedupe, KeyedValve, Valve } from './core/dedupe.js';
 import { Dispatcher, type Endpoint } from './core/dispatcher.js';
 import { coerce, CORE_COERCERS, exceptionKey, fromMessage, isMeaningless, issueKey, type WireException } from './core/exception.js';
-import { crashFile, DEFAULT_IGNORE, isServerSuppressed, matches } from './core/filters.js';
+import { crashFile, isKnownNoise, matches } from './core/filters.js';
 import { attempt, isObject, safeString, show } from './core/guard.js';
 import { runHooks } from './core/hooks.js';
 import { hexId, uuidv7 } from './core/ids.js';
@@ -581,12 +581,12 @@ export class Vinktar {
     const message = first.value;
     const headline = `${first.type}: ${message}`;
 
-    if (isServerSuppressed(message, first.stack) || isExtensionError(first.stack)) {
-      this.logger.debug('known noise; not sent', { message });
+    // Sent by default: the server keeps known noise and labels it, so a wrong match is still visible there.
+    if (this.o.ignoreKnownNoise && (isKnownNoise(message, first.stack) || isExtensionError(first.stack))) {
+      this.logger.debug('known noise, ignoreKnownNoise is on; not sent', { message });
 
       return '';
     }
-    if (!this.o.disableErrorDefaults && matches(DEFAULT_IGNORE, message)) return '';
     if (this.o.ignoreErrors.length > 0 && (matches(this.o.ignoreErrors, message) || matches(this.o.ignoreErrors, headline))) {
       this.logger.debug('ignored by ignoreErrors', { message });
 

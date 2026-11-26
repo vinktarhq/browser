@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Known browser noise is sent by default. Errors from browser extensions, `Script error.`,
+  ResizeObserver loops and the rest of the built-in list used to be dropped before sending. A
+  match can be wrong (a `Script error.` from your own cross-origin bundle looks like an ad
+  script's), and a dropped error cannot be looked at later. Vinktar now keeps these, labels them
+  as likely noise and lists them low.
+- New option `ignoreKnownNoise: true` drops them in the browser, as before.
+- `disableErrorDefaults` is deprecated and has no effect.
+
 ## 0.3.2
 
 ### Fixed

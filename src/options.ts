@@ -77,7 +77,9 @@ export interface VinktarOptions {
   ignoreErrors?: Array<string | RegExp>;
   denyUrls?: Array<string | RegExp>;
   allowUrls?: Array<string | RegExp>;
-  /** Turn off the built-in browser-noise ignore list. */
+  /** Drop known browser noise here instead of sending it. Off: it is sent, and Vinktar labels it as likely noise. */
+  ignoreKnownNoise?: boolean;
+  /** @deprecated Known noise is sent unless `ignoreKnownNoise` is on; this no longer changes anything. */
   disableErrorDefaults?: boolean;
 
   /** Properties on every event, under whatever `register()` persisted. */
@@ -154,6 +156,7 @@ export interface Resolved {
   readonly ignoreErrors: ReadonlyArray<string | RegExp>;
   readonly denyUrls: ReadonlyArray<string | RegExp>;
   readonly allowUrls: ReadonlyArray<string | RegExp>;
+  readonly ignoreKnownNoise: boolean;
   readonly disableErrorDefaults: boolean;
   readonly superProperties: Props;
   readonly sendDefaultPii: boolean;
@@ -188,7 +191,7 @@ const KNOWN = new Set<keyof VinktarOptions>([
   'enabledEnvironments', 'flushAt', 'flushIntervalMs', 'maxQueueSize', 'requestTimeoutMs', 'shutdownTimeout', 'gzip', 'persistQueue',
   'autoPageviews', 'autocapture', 'sessionTimeoutMs', 'sessionMaxMs', 'breadcrumbs', 'maxBreadcrumbs', 'sampleRate',
   'errorSampleRate', 'maxErrorsPerMinute', 'maxEventsPerMinute', 'dedupe', 'ignoreErrors', 'denyUrls', 'allowUrls',
-  'disableErrorDefaults', 'superProperties', 'sendDefaultPii', 'redactedKeys', 'propertyDenylist', 'disablePersistence',
+  'ignoreKnownNoise', 'disableErrorDefaults', 'superProperties', 'sendDefaultPii', 'redactedKeys', 'propertyDenylist', 'disablePersistence',
   'crossSubdomainCookie', 'useBeacon', 'optOutByDefault', 'respectDnt', 'filterBots', 'propagateIdentity', 'initialScope',
   'maxValueBytes', 'normalizeDepth', 'includeRawStack', 'attachStacktrace', 'integrations', 'beforeSend', 'beforeTrack',
   'beforeBreadcrumb', 'onError', 'logger',
@@ -326,6 +329,7 @@ export function resolve(options: VinktarOptions, logger: Logger, broken?: string
     ignoreErrors: patterns('ignoreErrors', options.ignoreErrors),
     denyUrls: patterns('denyUrls', options.denyUrls),
     allowUrls: patterns('allowUrls', options.allowUrls),
+    ignoreKnownNoise: options.ignoreKnownNoise === true,
     disableErrorDefaults: options.disableErrorDefaults ?? false,
     superProperties: isObject(options.superProperties) ? options.superProperties : {},
     sendDefaultPii: options.sendDefaultPii ?? false,

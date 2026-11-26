@@ -140,9 +140,10 @@ withScope((scope) => {
 unreported. The tags are restored when the callback returns, so work after an `await` inside it is
 not covered.
 
-What is filtered before anything is sent, so noise costs nothing: errors that come entirely from
-browser extensions, the well-known list of unactionable browser messages
-(`disableErrorDefaults: true` turns it off), your own `ignoreErrors`, `denyUrls` / `allowUrls`
+Known browser noise (errors that come entirely from browser extensions, and the well-known list of
+unactionable browser messages) is sent like any other error, and Vinktar labels it as likely noise
+and lists it low, so a wrong match stays visible. Set `ignoreKnownNoise: true` to drop it in the
+browser instead. What is filtered before anything is sent: your own `ignoreErrors`, `denyUrls` / `allowUrls`
 tested against the frame where the crash happened, repeats within five seconds of an error's first
 occurrence (counted, not sent), and a
 per-minute valve (25 by default) so a render loop cannot spend a month's quota in an afternoon.
@@ -212,7 +213,7 @@ Every number is clamped to a sane range with a warning rather than taken as give
 | `maxEventsPerMinute` / `maxErrorsPerMinute` | `600` / `25` | Client-side valves. |
 | `dedupe` | `true` | Send an identical error once per five seconds; the repeats are counted. |
 | `ignoreErrors` / `denyUrls` / `allowUrls` | `[]` | Strings (substring) or regular expressions. |
-| `disableErrorDefaults` | `false` | Turn off the built-in browser-noise list. |
+| `ignoreKnownNoise` | `false` | Drop known browser noise in the browser instead of sending it. |
 | `superProperties` | `{}` | On every event, under whatever `register()` persisted. |
 | `sendDefaultPii` | `false` | Full URLs, query strings and click ids. |
 | `redactedKeys` / `propertyDenylist` | `[]` | Extra key fragments to mask; top-level keys to drop. |

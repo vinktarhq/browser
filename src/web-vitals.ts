@@ -1,105 +1,77 @@
-import type { Integration, IntegrationHost } from './types.js';
+import { onCLS, onFCP, onINP, onLCP, onTTFB, type MetricWithAttribution } from 'web-vitals/attribution';
+
+import type { Integration, IntegrationHost, Props } from './types.js';
 
 /**
- * Core Web Vitals as `$web_vital` events: LCP, CLS, INP, FCP and TTFB.
+ * Core Web Vitals as `$web_vital` events: LCP, INP, CLS, FCP and TTFB, measured by Google's
+ * `web-vitals` library with attribution, so a slow LCP or INP says which element and which part
+ * of the time.
  *
- * Measured with `PerformanceObserver` and reported once, when the page is hidden, with the final
- * value: LCP and CLS keep changing while the page is visible, and reporting them early reports
- * the wrong number. No polyfills and no bfcache-restore re-measurement; the metrics are the
- * browser's own, and a browser without the observer types simply reports nothing.
+ * One event per report. The library reports when the page is hidden, again after a return if a
+ * value grew, after a back/forward-cache restore, and per soft navigation where the browser
+ * supports them. Every report of the same metric instance carries the same `$metric_id`, so the
+ * latest one per id is the value.
  *
  *     import { init } from '@vinktarhq/browser';
  *     import { webVitals } from '@vinktarhq/browser/web-vitals';
  *     init({ writeKey, integrations: [webVitals()] });
  */
-type Metric = 'LCP' | 'CLS' | 'INP' | 'FCP' | 'TTFB';
-
-const THRESHOLDS: Record<Metric, [good: number, poor: number]> = {
-  LCP: [2500, 4000],
-  CLS: [0.1, 0.25],
-  INP: [200, 500],
-  FCP: [1800, 3000],
-  TTFB: [800, 1800],
-};
-
-function rating(metric: Metric, value: number): 'good' | 'needs-improvement' | 'poor' {
-  const [good, poor] = THRESHOLDS[metric];
-
-  return value <= good ? 'good' : value <= poor ? 'needs-improvement' : 'poor';
-}
+const MAX_SELECTOR = 200;
 
 export function webVitals(): Integration {
   return {
     name: 'web-vitals',
     setup(host: IntegrationHost) {
-      if (typeof PerformanceObserver === 'undefined' || typeof document === 'undefined') return;
-      const values = new Map<Metric, number>();
-      const reported = new Set<Metric>();
-      const observers: PerformanceObserver[] = [];
-      const interactions = new Map<number, number>();
-      let cls = 0;
-
-      const observe = (type: string, callback: (entries: PerformanceEntryList) => void): void => {
-        try {
-          if (!PerformanceObserver.supportedEntryTypes?.includes(type)) return;
-          const observer = new PerformanceObserver((list) => callback(list.getEntries()));
-          observer.observe({ type, buffered: true });
-          observers.push(observer);
-        } catch {
-          // An unsupported entry type on this browser.
-        }
+      if (typeof document === 'undefined') return;
+      // The library cannot unsubscribe; a torn-down client just stops listening.
+      let live = true;
+      const report = (metric: MetricWithAttribution): void => {
+        if (live) host.track('$web_vital', describe(metric, host.pageviewId(metric.navigationURL)));
       };
-
-      observe('largest-contentful-paint', (entries) => {
-        const last = entries[entries.length - 1];
-        if (last !== undefined) values.set('LCP', last.startTime);
-      });
-      observe('layout-shift', (entries) => {
-        for (const entry of entries as Array<PerformanceEntry & { hadRecentInput?: boolean; value?: number }>) {
-          if (!entry.hadRecentInput) cls += entry.value ?? 0;
-        }
-        values.set('CLS', Math.round(cls * 1000) / 1000);
-      });
-      observe('paint', (entries) => {
-        for (const entry of entries) if (entry.name === 'first-contentful-paint') values.set('FCP', entry.startTime);
-      });
-      observe('event', (entries) => {
-        for (const entry of entries as Array<PerformanceEntry & { interactionId?: number }>) {
-          if (!entry.interactionId) continue;
-          interactions.set(entry.interactionId, Math.max(interactions.get(entry.interactionId) ?? 0, entry.duration));
-        }
-        // INP is the 98th percentile of interactions, approximated as the worst for few and the
-        // 50th-worst-per-50 for many, which is what the reference implementation does.
-        const sorted = [...interactions.values()].sort((a, b) => b - a);
-        const index = Math.min(sorted.length - 1, Math.floor(sorted.length / 50));
-        const inp = sorted[index];
-        if (inp !== undefined) values.set('INP', inp);
-      });
-      try {
-        const nav = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined;
-        if (nav !== undefined && nav.responseStart > 0) values.set('TTFB', nav.responseStart);
-      } catch {
-        // No navigation timing here.
-      }
-
-      const report = (): void => {
-        for (const [metric, value] of values) {
-          if (reported.has(metric)) continue;
-          reported.add(metric);
-          host.track('$web_vital', { $metric: metric, $value: Math.round(value * 1000) / 1000, $rating: rating(metric, value) });
-        }
-      };
-      const onHide = (): void => {
-        if (document.visibilityState === 'hidden') report();
-      };
-      document.addEventListener('visibilitychange', onHide);
-      window.addEventListener('pagehide', report);
+      const options = { reportSoftNavs: true };
+      onLCP(report, options);
+      onINP(report, options);
+      onCLS(report, options);
+      onFCP(report, options);
+      onTTFB(report, options);
 
       return () => {
-        document.removeEventListener('visibilitychange', onHide);
-        window.removeEventListener('pagehide', report);
-        for (const observer of observers) observer.disconnect();
+        live = false;
       };
     },
   };
+}
+
+function describe(metric: MetricWithAttribution, pageviewId: string | undefined): Props {
+  const props: Props = {
+    $metric: metric.name,
+    $value: Math.round(metric.value * 1000) / 1000,
+    $rating: metric.rating,
+    $metric_id: metric.id,
+    $navigation_type: metric.navigationType.replace(/-/g, '_'),
+  };
+  if (pageviewId !== undefined) props['$pageview_id'] = pageviewId;
+  const set = (key: string, value: string | number | undefined): void => {
+    if (typeof value === 'number') props[key] = Math.round(value);
+    else if (typeof value === 'string' && value !== '') props[key] = value.slice(0, MAX_SELECTOR);
+  };
+  if (metric.name === 'LCP') {
+    const a = metric.attribution;
+    set('$target', a.target);
+    set('$time_to_first_byte', a.timeToFirstByte);
+    set('$resource_load_delay', a.resourceLoadDelay);
+    set('$resource_load_duration', a.resourceLoadDuration);
+    set('$element_render_delay', a.elementRenderDelay);
+  } else if (metric.name === 'INP') {
+    const a = metric.attribution;
+    set('$target', a.interactionTarget);
+    set('$interaction_type', a.interactionType);
+    set('$input_delay', a.inputDelay);
+    set('$processing_duration', a.processingDuration);
+    set('$presentation_delay', a.presentationDelay);
+  } else if (metric.name === 'CLS') {
+    set('$target', metric.attribution.largestShiftTarget);
+  }
+
+  return props;
 }

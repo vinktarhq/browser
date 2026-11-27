@@ -39,16 +39,18 @@ export function memoryStore(): Store {
 
 const PROBE = '__vk_probe__';
 
-function webStore(kind: 'local' | 'session'): Store | null {
+function webStore(kind: 'local' | 'session', probe = true): Store | null {
   let backing: globalThis.Storage;
   try {
     // Reading `window.localStorage` itself throws in a sandboxed frame.
     const candidate = kind === 'local' ? natives.window?.localStorage : natives.window?.sessionStorage;
     if (candidate === undefined || candidate === null) return null;
     backing = candidate;
-    backing.setItem(PROBE, '1');
-    if (backing.getItem(PROBE) !== '1') return null;
-    backing.removeItem(PROBE);
+    if (probe) {
+      backing.setItem(PROBE, '1');
+      if (backing.getItem(PROBE) !== '1') return null;
+      backing.removeItem(PROBE);
+    }
   } catch {
     return null;
   }
@@ -201,8 +203,12 @@ export function cookieDomain(hostname: string = natives.window?.location.hostnam
 }
 
 export interface Stores {
-  /** Device, user, session, consent. Small, and shared across subdomains when asked. */
+  /** False when cookieless: everything but an explicit opt-out lives in memory. */
+  readonly persistent: boolean;
+  /** Device, user, session. Small, and shared across subdomains when asked. */
   readonly identity: Store;
+  /** The opt-in/opt-out flag. The identity store, or localStorage unprobed when cookieless. */
+  readonly consent: Store;
   /** Queues, super properties, attribution. Never a cookie. */
   readonly data: Store;
   /** Per-tab: the tab id and the unloading flag. */
@@ -216,7 +222,9 @@ export interface StoreOptions {
 }
 
 export function createStores(options: StoreOptions): Stores {
-  if (options.disablePersistence) return { identity: memoryStore(), data: memoryStore(), tab: memoryStore() };
+  if (options.disablePersistence) {
+    return { persistent: false, identity: memoryStore(), consent: webStore('local', false) ?? memoryStore(), data: memoryStore(), tab: memoryStore() };
+  }
 
   const local = webStore('local');
   const session = webStore('session');
@@ -232,7 +240,9 @@ export function createStores(options: StoreOptions): Stores {
   const identity = (options.crossSubdomainCookie ? cookie() ?? local : local ?? cookie()) ?? memoryStore();
 
   return {
+    persistent: true,
     identity,
+    consent: identity,
     data: local ?? memoryStore(),
     tab: session ?? memoryStore(),
   };

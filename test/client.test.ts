@@ -36,7 +36,9 @@ afterEach(async () => {
 
 const KEY = 'vnk_pk_test_key_0001';
 // happy-dom reports `navigator.webdriver`, so the bot filter would (correctly) drop every analytics event.
-const BASE = { writeKey: KEY, logger, filterBots: false } as const;
+// Most of these tests are about identity, which only persistent mode has; COOKIELESS is the default.
+const COOKIELESS = { writeKey: KEY, logger, filterBots: false } as const;
+const BASE = { ...COOKIELESS, persistence: 'localStorage' } as const;
 
 describe('init', () => {
   it('is inert with a secret key and without a key, and says so once at error level', async () => {
@@ -69,8 +71,9 @@ describe('init', () => {
     expect(first?.['device_id']).toMatch(/^[0-9a-f-]{36}$/);
     expect(first?.['session_id']).toMatch(/^[0-9a-f-]{36}$/);
     expect((first?.['context'] as Record<string, unknown>)['$lib']).toBe('vinktar-browser');
-    expect(harness.requests[0]!.headers['x-vinktar-key']).toBe(KEY);
-    expect(Object.keys(harness.requests[0]!.headers).sort()).toEqual(['content-type', 'x-vinktar-key']);
+    // CORS-simple, so the first pageview needs no preflight.
+    expect(harness.requests[0]!.url).toContain(`?_k=${KEY}`);
+    expect(harness.requests[0]!.headers).toEqual({ 'content-type': 'text/plain' });
   });
 
   it('compresses bodies of a kilobyte and over, and sends exactly the three allowed headers', async () => {
@@ -175,6 +178,130 @@ describe('analytics', () => {
     expect(views).toHaveLength(1);
     expect((views[0]!['payload'] as Record<string, unknown>)['$navigation_type']).toBe('pushState');
     await client.close();
+  });
+});
+
+describe('web analytics', () => {
+  const visibility = (state: 'hidden' | 'visible'): void => {
+    Object.defineProperty(document, 'visibilityState', { value: state, configurable: true });
+    document.dispatchEvent(new Event('visibilitychange'));
+  };
+  const payload = (event: Record<string, unknown> | undefined): Record<string, unknown> => event?.['payload'] as Record<string, unknown>;
+  const named = (name: string): Array<Record<string, unknown>> => harness.batches().filter((e) => e['name'] === name);
+
+  afterEach(() => {
+    visibility('visible');
+    vi.useRealTimers();
+    window.history.replaceState({}, '', '/');
+  });
+
+  it('is cookieless by default: no ids sent and nothing stored, a user id for the life of the page', async () => {
+    document.cookie.split(';').forEach((c) => (document.cookie = `${c.split('=')[0]}=; Max-Age=0`));
+    const client = make({ ...COOKIELESS, useBeacon: false });
+    client.identify('user_1');
+    client.register({ theme: 'dark' });
+    await tick(5);
+    client.track('clicked');
+    client.captureException(new Error('boom'));
+    window.dispatchEvent(new Event('pagehide'));
+    await tick(5);
+    await client.flush();
+
+    const sent = [...harness.batches(), ...harness.errors()];
+    expect(sent.map((e) => e['name'] ?? 'error')).toEqual(['$pageview', 'clicked', '$engagement', 'error']);
+    for (const item of sent) {
+      expect(item['device_id']).toBeUndefined();
+      expect(item['session_id']).toBeUndefined();
+      expect(item['user_id']).toBe('user_1');
+    }
+    expect(Object.keys(payload(named('clicked')[0])).filter((k) => k.startsWith('$initial_'))).toEqual([]);
+    expect(harness.requests.some((r) => r.body['identify'] !== undefined)).toBe(false);
+    expect([localStorage.length, sessionStorage.length, document.cookie]).toEqual([0, 0, '']);
+    expect(client.getDeviceId()).toBe('');
+  });
+
+  it('waits for a hidden or prerendered page to be seen before the first pageview', async () => {
+    Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true });
+    const client = make({ ...COOKIELESS });
+    await tick(5);
+    window.history.replaceState({}, '', '/en/');
+    await client.flush();
+    expect(named('$pageview')).toHaveLength(0);
+
+    visibility('visible');
+    await client.flush();
+    const views = named('$pageview');
+    expect(views).toHaveLength(1);
+    expect(payload(views[0])['$navigation_type']).toBe('navigate');
+    expect((views[0]!['context'] as Record<string, unknown>)['$current_url']).toBe('http://localhost:3000/en/');
+  });
+
+  it('counts a back/forward-cache restore, and gives an in-app pageview the previous page as referrer', async () => {
+    const client = make({ ...COOKIELESS });
+    await tick(5);
+    window.history.pushState({}, '', '/pricing');
+    window.dispatchEvent(Object.assign(new Event('pageshow'), { persisted: true }));
+    await client.flush();
+
+    const views = named('$pageview');
+    expect(views.map((v) => payload(v)['$navigation_type'])).toEqual(['navigate', 'pushState', 'back_forward_cache']);
+    expect(new Set(views.map((v) => payload(v)['$pageview_id'])).size).toBe(3);
+    expect(payload(views[0])['$pageview_id']).toBe(views[0]!['event_id']);
+    const context = views[1]!['context'] as Record<string, unknown>;
+    expect([context['$referrer'], context['$referring_domain']]).toEqual(['http://localhost:3000/', 'localhost']);
+  });
+
+  it('sends visible time as increments that add up across hides, never a zero', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: 1_000_000 });
+    const client = make({ ...COOKIELESS, useBeacon: false });
+    await tick(5);
+    vi.setSystemTime(1_005_000);
+    visibility('hidden');
+    vi.setSystemTime(1_065_000); // a minute in the background is not engagement
+    visibility('visible');
+    vi.setSystemTime(1_068_000);
+    visibility('hidden');
+    visibility('visible');
+    visibility('hidden');
+    await client.flush();
+
+    const view = named('$pageview')[0]!;
+    const engagements = named('$engagement').map(payload);
+    expect(engagements.map((e) => e['$engaged_ms'])).toEqual([5_000, 3_000]);
+    for (const e of engagements) {
+      expect(e['$pageview_id']).toBe(view['event_id']);
+      expect(e['$scroll_depth']).toBe(100);
+    }
+  });
+
+  it('classifies outbound links, downloads, contact links and forms, and fires declarative events', async () => {
+    document.body.innerHTML = `
+      <a id="out" href="https://other.example/page?ref=x">out</a>
+      <a id="pdf" href="/files/report.pdf#page=2">pdf</a>
+      <a id="mail" href="mailto:Sales@Acme.example?subject=hi">mail</a>
+      <a id="tel" href="tel:+15550100">tel</a>
+      <a id="in" href="/about">in</a>
+      <button id="cta" data-vinktar-event="cta_clicked" data-vinktar-prop-plan-name="pro">Go</button>
+      <form id="signup" action="/signup?src=x"><input name="email" value="a@b.c"></form>`;
+    const stop = (e: Event): void => e.preventDefault();
+    document.addEventListener('click', stop);
+    const client = make({ ...COOKIELESS, autoPageviews: false, autoEvents: true });
+    for (const id of ['out', 'pdf', 'mail', 'tel', 'in', 'cta']) document.getElementById(id)!.click();
+    document.getElementById('out')!.dispatchEvent(new MouseEvent('auxclick', { bubbles: true, button: 1 }));
+    document.getElementById('signup')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await client.flush();
+    document.removeEventListener('click', stop);
+    document.body.innerHTML = '';
+
+    expect(harness.batches().map((e) => [e['name'], payload(e)])).toEqual([
+      ['link_clicked', { kind: 'outbound', url: 'https://other.example/page', host: 'other.example' }],
+      ['file_downloaded', { url: 'http://localhost:3000/files/report.pdf', extension: 'pdf' }],
+      ['link_clicked', { kind: 'mailto', host: 'acme.example' }],
+      ['link_clicked', { kind: 'tel' }],
+      ['cta_clicked', { plan_name: 'pro' }],
+      ['link_clicked', { kind: 'outbound', url: 'https://other.example/page', host: 'other.example' }],
+      ['form_submitted', { form_id: 'signup', form_action: '/signup' }],
+    ]);
   });
 });
 
@@ -415,7 +542,7 @@ describe('lifecycle', () => {
   });
 
   it('keeps records sent from a hidden tab until the keepalive request is answered', async () => {
-    const client = make({ ...BASE, autoPageviews: false, flushIntervalMs: 60_000 });
+    const client = make({ ...BASE, autoPageviews: false, flushIntervalMs: 60_000, useBeacon: false });
     const hide = (state: 'hidden' | 'visible'): void => {
       Object.defineProperty(document, 'visibilityState', { value: state, configurable: true });
       document.dispatchEvent(new Event('visibilitychange'));

@@ -43,7 +43,9 @@ ways. `npm test` imports from `src/`, so it can pass while the published package
 
 ## House style
 
-- **Zero runtime dependencies.** A test asserts it. Every dependency is bytes on someone's page.
+- **No runtime dependencies in the main bundle.** The one in `package.json` is `web-vitals`, and
+  only the `web-vitals` entry imports it; a test and the size budget hold both. Every dependency
+  is bytes on someone's page.
 - **Nothing fails silently.** Every drop, refusal and no-op is a warning that names the
   consequence, printed once and rate limited.
 - **Never throw into the application.** Every public method, every handler and every listener is

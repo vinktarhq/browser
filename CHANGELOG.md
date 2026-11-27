@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.4.0
+
+Web analytics that count what a visitor actually saw, without cookies. Two changes need action
+when upgrading: read "Changed".
+
+### Changed
+
+- **Cookieless by default.** Nothing is written to cookies, localStorage or sessionStorage, and
+  events and errors carry no `device_id` and no `session_id`; the server counts visitors from a
+  daily-salted hash and visits from 30 minutes of inactivity. `identify()` still sends the user id
+  on every event for the life of the page. `$initial_*` attribution, persisted `register()`
+  properties and the persisted queue need storage and are gone in this mode. The only thing
+  written is an explicit `optOut()`, so the visitor stays opted out. To keep the previous
+  behaviour (device id, sessions, identity across loads), pass `persistence: 'localStorage'`, or
+  `data-persistence="localStorage"` on the script tag. `disablePersistence: true` now means the
+  same as the default; `crossSubdomainCookie` and `propagateIdentity` need persistence.
+- **`$pageleave` is replaced by `$engagement`, and it is on by default.** It is sent every time
+  the page is hidden and before every route change, with `$engaged_ms` (visible time since the
+  last one, an increment to sum, never 0, at most 30 minutes), `$scroll_depth` (the furthest seen,
+  in percent of the page) and `$pageview_id`. `autoPageviews: { leave }` is gone;
+  `engagement: false` turns the new event off. Queries on `$pageleave.$duration_ms` should move to
+  the sum of `$engagement.$engaged_ms` per `$pageview_id`.
+- The first pageview waits until the page is visible, so a prerendered page or a background tab
+  nobody looked at is not counted.
+- The referrer of a route change in a single-page app is the previous page, not the landing
+  referrer.
+- Uncompressed requests are sent as `text/plain` with the key in the query string, so they need no
+  CORS preflight. Compressed ones are unchanged.
+- When the page is hidden, the queue goes out with a beacon first, and `pagehide` no longer sends
+  the same records again.
+- The web-vitals entry uses Google's `web-vitals` library (attribution build), now a dependency,
+  and sends one `$web_vital` per report with `$metric_id`, `$navigation_type`, `$pageview_id` and
+  attribution: the element and the LCP subparts or INP phases. It is about 5.5 kB, up from 0.7 kB.
+- The main bundle is about 1.6 kB larger.
+
+### Added
+
+- Every `$pageview` carries `$pageview_id` (its own `event_id`) and `$navigation_type`, including
+  `navigate`, `reload`, `back_forward` and `prerender` on the first one.
+- A page restored from the back/forward cache sends a pageview, `$navigation_type:
+  back_forward_cache`.
+- `autoEvents: true`: `link_clicked` (outbound, `mailto:`, `tel:`), `file_downloaded` and
+  `form_submitted`, with no link text, address or field value.
+- `data-vinktar-event` and `data-vinktar-prop-*` attributes send an event on click, or on submit
+  for a form, without code.
+- `page_not_found`, for a page with `data-vinktar-404` or a title matching `notFound`.
+- `localStorage.vinktar_ignore = 'true'` keeps a browser's analytics out, for your own visits.
+- `IntegrationHost.pageviewId(url?)`, so an integration can tie what it sends to a pageview.
+
+### Fixed
+
+- Cubot phones were dropped as bots because their user agent contains "bot". Cypress, PhantomJS
+  (`_phantom`, `callPhantom`), Nightmare and a `Math.random` that returns a constant are now
+  treated as automation.
+- The bundle loaded twice on one page (a tag in the theme and one in a tag manager) started two
+  clients and counted everything twice. The second copy now uses the first one's client.
+- A `replaceState` that changed the path before the first pageview was sent counted as a second
+  pageview.
+
 ## 0.3.2
 
 ### Fixed

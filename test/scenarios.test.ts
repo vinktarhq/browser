@@ -91,7 +91,8 @@ function arg(value: unknown): unknown {
 
 function clientOptions(scenario: Scenario): Record<string, unknown> {
   const { hooks, ...rest } = scenario.options ?? {};
-  const options: Record<string, unknown> = { writeKey: KEY, filterBots: false, autoPageviews: false, flushIntervalMs: 60_000, logger: () => {}, ...rest };
+  // The scenarios are written against a device id, which only persistent identity has.
+  const options: Record<string, unknown> = { writeKey: KEY, filterBots: false, autoPageviews: false, persistence: 'localStorage', flushIntervalMs: 60_000, logger: () => {}, ...rest };
   if (hooks === 'poisonProperty') {
     options['beforeTrack'] = (event: Record<string, unknown>) => (event['name'] === 'poison' ? { ...event, poison: 10n } : event);
   }

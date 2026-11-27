@@ -1,5 +1,5 @@
-import { installAutocapture } from './browser/autocapture.js';
-import { initialAttribution, isLikelyBot, pageContext } from './browser/context.js';
+import { installAutocapture, installDomEvents } from './browser/autocapture.js';
+import { currentUrl, initialAttribution, isLikelyBot, pageContext } from './browser/context.js';
 import { installCrumbSources } from './browser/crumbs.js';
 import { DOM_COERCERS, installGlobalHandlers, isExtensionError, stampDebugIds, unwrapBrowserValue, type GlobalMechanism } from './browser/errors.js';
 import { Identity, namespaceFor } from './browser/identity.js';
@@ -12,7 +12,7 @@ import { BrowserTransport } from './browser/transport.js';
 import { Breadcrumbs, toBreadcrumb, type Breadcrumb } from './core/breadcrumbs.js';
 import { validUserId } from './core/blocked.js';
 import { Dedupe, KeyedValve, Valve } from './core/dedupe.js';
-import { Dispatcher, type Endpoint } from './core/dispatcher.js';
+import { Dispatcher, type Outbound } from './core/dispatcher.js';
 import { coerce, CORE_COERCERS, exceptionKey, fromMessage, isMeaningless, issueKey, type WireException } from './core/exception.js';
 import { crashFile, DEFAULT_IGNORE, isServerSuppressed, matches } from './core/filters.js';
 import { attempt, isObject, safeString, show } from './core/guard.js';
@@ -57,6 +57,18 @@ const QUEUE_BYTES = 2 * 1024 * 1024;
 /** How soon the counts of what was dropped are sent when nothing else is going out to carry them. */
 const REPORT_INTERVAL_MS = 60_000;
 const ERROR_QUEUE_BYTES = 512 * 1024;
+/** The most one `$engagement` may claim; a tab left visible overnight is not eight hours of reading. */
+const MAX_ENGAGED_MS = 30 * 60_000;
+
+/** The pageview engagement is being measured for. `since` is when it last became visible, 0 while hidden. */
+interface View {
+  readonly id: string;
+  readonly href: string;
+  readonly url: string;
+  since: number;
+  engaged: number;
+  scroll: number;
+}
 
 export class Vinktar {
   readonly version = VERSION;
@@ -87,8 +99,12 @@ export class Vinktar {
   private closing: Promise<boolean> | null = null;
   private inert: string | null;
   private pageKey = '';
-  private pageStarted = 0;
-  private pageMaxScroll = 0;
+  private waitingForVisible = false;
+  private view: View | null = null;
+  private views: Array<[href: string, id: string]> = [];
+  private docHeight = 0;
+  /** Entries an unload send put in a keepalive request that has not answered yet: not sent twice. */
+  private readonly handedOff = new Set<Entry>();
 
   constructor(options: VinktarOptions = {}) {
     const read = readOptions(options);
@@ -117,7 +133,7 @@ export class Vinktar {
     const ns = namespaceFor(this.o.writeKey);
     this.keys = { sup: `${ns}_sup`, attr: `${ns}_attr` };
     this.stores = createStores({
-      disablePersistence: this.o.disablePersistence || this.inert !== null,
+      disablePersistence: this.o.persistence === 'memory' || this.inert !== null,
       crossSubdomainCookie: this.o.crossSubdomainCookie,
       onLarge: (key, bytes) => this.logger.warn(`the ${key} cookie is ${bytes} bytes; browsers drop cookies near 4 KiB`),
     });
@@ -172,8 +188,11 @@ export class Vinktar {
 
   private start(): void {
     this.supers = (parseJson(this.stores.data.get(this.keys.sup)) as Props | undefined) ?? {};
-    const attribution = initialAttribution(this.stores.data, this.keys.attr, this.o.sendDefaultPii);
-    for (const [key, value] of Object.entries(attribution)) this.supers[key] ??= value;
+    // First-touch attribution needs storage to mean anything; cookieless, the server has the first pageview.
+    if (this.stores.persistent) {
+      const attribution = initialAttribution(this.stores.data, this.keys.attr, this.o.sendDefaultPii);
+      for (const [key, value] of Object.entries(attribution)) this.supers[key] ??= value;
+    }
 
     const restored = this.persistence?.restore();
     if (restored !== undefined) {
@@ -197,12 +216,13 @@ export class Vinktar {
     }
 
     const anyCrumb = Object.values(this.o.breadcrumbs).some(Boolean);
-    if ((this.o.errors && anyCrumb) || this.o.propagateIdentity.length > 0) {
+    const propagateTo = this.stores.persistent ? this.o.propagateIdentity : [];
+    if ((this.o.errors && anyCrumb) || propagateTo.length > 0) {
       installCrumbSources(this.instrumentation, {
         sources: this.o.errors ? this.o.breadcrumbs : { console: false, network: false, navigation: false, click: false },
         sendDefaultPii: this.o.sendDefaultPii,
         ingestHost: this.o.host,
-        propagateTo: this.o.propagateIdentity,
+        propagateTo,
         identity: () => ({ deviceId: this.identity.deviceId, sessionId: this.identity.peekSessionId() }),
         add: (crumb) => this.addBreadcrumb(crumb),
         logger: this.logger,
@@ -212,31 +232,39 @@ export class Vinktar {
 
     if (this.o.analytics && this.o.autoPageviews.enabled) {
       const parts = this.o.autoPageviews;
-      this.pageKey = locationKey(win.location.href, parts);
       const unsubscribe = this.navigation.subscribe((change) => {
+        // Nothing to change from before the first pageview, which takes the URL as it is by then.
+        if (this.pageKey === '') return;
         const key = locationKey(change.to, parts);
         // A framework can call replaceState a dozen times per transition with only state moving;
         // a pageview is a change in the part of the URL the application said matters.
         if (key === this.pageKey) return;
-        if (parts.leave) this.pageLeave();
         this.pageKey = key;
-        this.page(undefined, { $navigation_type: change.type });
+        this.guarded(() => this.pageview(undefined, { $navigation_type: change.type }));
       });
       this.teardowns.push(unsubscribe);
 
-      if (parts.leave) {
-        this.pageStarted = Date.now();
-        this.instrumentation.listen(win, 'scroll', () => this.noteScroll(), { passive: true });
-      }
-
       // On the next tick, so an `identify()` in the same script runs first and the first pageview
-      // already carries the user.
+      // already carries the user. A prerendered or background tab waits until someone sees it.
       natives.setTimeout(() => {
         if (this.closed) return;
-        this.page();
-        // Sent at once rather than at the interval, so an install screen sees its first event now.
-        void this.flush();
+        if (doc.visibilityState === 'visible') this.guarded(() => this.firstPageview());
+        else this.waitingForVisible = true;
       }, 0);
+    }
+
+    if (this.o.analytics && this.o.engagement) {
+      this.instrumentation.listen(win, 'scroll', () => this.noteScroll(), { passive: true });
+      // The height is cached here so the scroll handler only compares numbers and never forces layout.
+      attempt(() => {
+        const observer = new ResizeObserver(() => this.measure());
+        observer.observe(doc.documentElement);
+        this.teardowns.push(() => observer.disconnect());
+      }, undefined);
+    }
+
+    if (this.o.analytics) {
+      installDomEvents(this.instrumentation, { auto: this.o.autoEvents, sendDefaultPii: this.o.sendDefaultPii, track: (name, props) => this.track(name, props) });
     }
 
     if (this.o.analytics && (this.o.autocapture.clicks || this.o.autocapture.forms)) {
@@ -248,16 +276,23 @@ export class Vinktar {
       });
     }
 
-    // Unload: `pagehide` and `visibilitychange` → hidden, never `unload`, which disables the
-    // back/forward cache and does not fire on mobile. `pageshow` undoes the unloading state when
-    // the same page instance is restored from that cache.
-    this.instrumentation.listen(win, 'pagehide', () => this.onUnload(true));
+    // Unload: `visibilitychange` → hidden, the last event a mobile tab or a closed one reliably
+    // gets, and `pagehide` for what was captured after it. Never `unload`, which disables the
+    // back/forward cache and does not fire on mobile.
+    this.instrumentation.listen(win, 'pagehide', () => this.onUnload());
     this.instrumentation.listen(doc, 'visibilitychange', () => {
-      if (doc.visibilityState === 'hidden') this.onUnload(false);
+      if (doc.visibilityState === 'hidden') return this.onUnload();
+      if (this.view !== null && this.view.since === 0) this.view.since = Date.now();
+      if (this.waitingForVisible) this.guarded(() => this.firstPageview());
       // A tab coming back may have missed a logout elsewhere (a cookie store fires no event).
-      else this.adoptSharedIdentity();
+      this.adoptSharedIdentity();
     });
-    this.instrumentation.listen(win, 'pageshow', () => {
+    this.instrumentation.listen(win, 'pageshow', (event) => {
+      if ((event as PageTransitionEvent).persisted) {
+        // Restored from the back/forward cache: the visitor is looking at the page again. Not
+        // deduplicated by URL, because the URL is the same by definition.
+        if (this.pageKey !== '') this.guarded(() => this.pageview(undefined, { $navigation_type: 'back_forward_cache' }, true));
+      }
       if (this.dispatcher.pending > 0) this.scheduleFlush(this.o.flushIntervalMs);
     });
     this.instrumentation.listen(win, 'online', () => {
@@ -278,6 +313,11 @@ export class Vinktar {
       captureException: (error, hint) => this.captureException(error, hint),
       addBreadcrumb: (crumb) => this.addBreadcrumb(crumb),
       logger: { warn: (m) => this.logger.warn(m), debug: (m) => this.logger.debug(m) },
+      pageviewId: (url) => {
+        for (let i = this.views.length - 1; i >= 0; i -= 1) if (this.views[i]![0] === url) return this.views[i]![1];
+
+        return this.view?.id;
+      },
     };
     for (const integration of this.o.integrations) this.setupIntegration(integration, host);
   }
@@ -294,81 +334,121 @@ export class Vinktar {
   // Analytics -----------------------------------------------------------------------------------
 
   track(name: string, properties?: Props): void {
-    this.guarded(() => {
-      if (!this.ready('track')) return;
-      if (typeof name !== 'string' || name.trim() === '') {
-        this.logger.warn('track() needs an event name; nothing was sent');
+    this.guarded(() => this.record(name, properties));
+  }
 
-        return;
-      }
-      if (!this.o.analytics) {
-        this.logger.debug(`analytics is off; "${name}" was not sent`);
+  private record(name: string, properties: Props | undefined, id = uuidv7(), extraContext: Props = {}): void {
+    if (!this.ready('track')) return;
+    if (typeof name !== 'string' || name.trim() === '') {
+      this.logger.warn('track() needs an event name; nothing was sent');
 
-        return;
-      }
-      if (this.o.filterBots && isLikelyBot()) {
-        this.logger.debug('automated traffic; analytics are not sent');
+      return;
+    }
+    if (!this.o.analytics) {
+      this.logger.debug(`analytics is off; "${name}" was not sent`);
 
-        return;
-      }
-      if (!this.eventValve.take()) {
-        this.drop('ratelimit', 'event');
-        this.logger.warn(`more than ${this.o.maxEventsPerMinute} events in a minute; dropping until the valve refills`);
+      return;
+    }
+    if (this.o.filterBots && isLikelyBot()) {
+      this.logger.debug('automated traffic; analytics are not sent');
 
-        return;
-      }
-      if (!sampled(this.identity.deviceId, this.o.sampleRate)) {
-        this.drop('sample_rate', 'event');
+      return;
+    }
+    if (ignoredBrowser()) {
+      this.logger.debug('localStorage.vinktar_ignore is set in this browser; analytics are not sent');
 
-        return;
-      }
+      return;
+    }
+    if (!this.eventValve.take()) {
+      this.drop('ratelimit', 'event');
+      this.logger.warn(`more than ${this.o.maxEventsPerMinute} events in a minute; dropping until the valve refills`);
 
-      const context = normalize(pageContext(this.o), this.normalizeOptions);
-      const payload = normalize(
-        { ...this.o.superProperties, ...this.supers, ...(isObject(properties) ? properties : {}) },
-        this.normalizeOptions,
-        (key, reason) => this.logger.warn(`property "${key}" on "${name}" was ${reason === 'truncated' ? 'truncated' : reason === 'depth' ? 'flattened past depth ' + this.o.normalizeDepth : 'dropped: too many properties'}`),
-      );
-      const event: Record<string, unknown> = {
-        name: truncateToBytes(name.trim(), 255),
-        event_id: uuidv7(),
-        timestamp: new Date().toISOString(),
-        device_id: this.identity.deviceId,
-        session_id: this.identity.sessionId(),
-        payload: this.capProperties(name, payload, context),
-        context,
-      };
-      if (this.identity.userId !== null) event['user_id'] = this.identity.userId;
+      return;
+    }
+    if (!sampled(this.identity.deviceId, this.o.sampleRate)) {
+      this.drop('sample_rate', 'event');
 
-      const hooked = runHooks(this.o.beforeTrack, event);
-      if (hooked.value === null) {
-        this.drop('before_send', 'event');
-        if (hooked.threw !== undefined) this.logger.warn('beforeTrack threw; the event was dropped', { error: safeString(hooked.threw) });
+      return;
+    }
 
-        return;
-      }
+    const context = normalize({ ...pageContext(this.o), ...extraContext }, this.normalizeOptions);
+    const payload = normalize(
+      { ...this.o.superProperties, ...this.supers, ...(isObject(properties) ? properties : {}) },
+      this.normalizeOptions,
+      (key, reason) => this.logger.warn(`property "${key}" on "${name}" was ${reason === 'truncated' ? 'truncated' : reason === 'depth' ? 'flattened past depth ' + this.o.normalizeDepth : 'dropped: too many properties'}`),
+    );
+    const event: Record<string, unknown> = {
+      name: truncateToBytes(name.trim(), 255),
+      event_id: id,
+      timestamp: new Date().toISOString(),
+      ...(this.stores.persistent ? { device_id: this.identity.deviceId, session_id: this.identity.sessionId() } : {}),
+      payload: this.capProperties(name, payload, context),
+      context,
+    };
+    if (this.identity.userId !== null) event['user_id'] = this.identity.userId;
 
-      const final = this.o.beforeTrack.length > 0 ? this.renormalizeEvent(name, hooked.value) : hooked.value;
-      if (!this.dispatcher.events.push('event', final)) {
-        this.drop('before_send', 'event');
-        this.logger.warn(`"${name}" was dropped: beforeTrack returned something that cannot be sent (a BigInt, a cycle, or a promise)`);
+    const hooked = runHooks(this.o.beforeTrack, event);
+    if (hooked.value === null) {
+      this.drop('before_send', 'event');
+      if (hooked.threw !== undefined) this.logger.warn('beforeTrack threw; the event was dropped', { error: safeString(hooked.threw) });
 
-        return;
-      }
-      this.afterCapture();
-    });
+      return;
+    }
+
+    const final = this.o.beforeTrack.length > 0 ? this.renormalizeEvent(name, hooked.value) : hooked.value;
+    if (!this.dispatcher.events.push('event', final)) {
+      this.drop('before_send', 'event');
+      this.logger.warn(`"${name}" was dropped: beforeTrack returned something that cannot be sent (a BigInt, a cycle, or a promise)`);
+
+      return;
+    }
+    this.afterCapture();
   }
 
   page(name?: string, properties?: Props): void {
-    this.guarded(() => {
-      const props: Props = { ...(isObject(properties) ? properties : {}) };
-      if (typeof name === 'string' && name !== '') props['$page_name'] = name;
-      if (this.o.autoPageviews.leave) {
-        this.pageStarted = Date.now();
-        this.pageMaxScroll = 0;
-      }
-      this.track('$pageview', props);
-    });
+    this.guarded(() => this.pageview(name, properties));
+  }
+
+  private firstPageview(): void {
+    this.waitingForVisible = false;
+    this.pageKey = locationKey(natives.window!.location.href, this.o.autoPageviews);
+    this.pageview(undefined, { $navigation_type: loadType() });
+    // Sent at once rather than at the interval, so an install screen sees its first event now.
+    void this.flush();
+  }
+
+  /** `restored`: back from the back/forward cache, where the referrer is still the document's own. */
+  private pageview(name: string | undefined, properties: Props | undefined, restored = false): void {
+    const props: Props = { ...(isObject(properties) ? properties : {}) };
+    if (typeof name === 'string' && name !== '') props['$page_name'] = name;
+    const previous = this.view;
+    this.engage();
+
+    const id = uuidv7();
+    props['$pageview_id'] = id;
+    const context: Props = {};
+    // After the first pageview, the visitor came from the page before, not from the landing referrer.
+    if (previous !== null && !restored) {
+      context['$referrer'] = previous.url;
+      context['$referring_domain'] = natives.window?.location.hostname ?? '';
+    }
+    this.record('$pageview', props, id, context);
+
+    const href = natives.window?.location.href ?? '';
+    this.view = { id, href, url: currentUrl(this.o.sendDefaultPii), since: natives.document?.visibilityState === 'visible' ? Date.now() : 0, engaged: 0, scroll: 0 };
+    this.views = [...this.views.slice(-9), [href, id]];
+    this.measure();
+    this.checkNotFound();
+  }
+
+  private checkNotFound(): void {
+    const doc = natives.document;
+    if (doc === undefined) return;
+    const check = (): void => {
+      if (doc.querySelector('[data-vinktar-404]') !== null || (this.o.notFound.length > 0 && matches(this.o.notFound, doc.title))) this.track('page_not_found');
+    };
+    if (doc.readyState === 'loading') this.instrumentation.listen(doc, 'DOMContentLoaded', check, { once: true });
+    else check();
   }
 
   identify(userId: string, traits?: Traits, traitsOnce?: Traits, options?: IdentifyOptions): void {
@@ -388,20 +468,22 @@ export class Vinktar {
       for (const drop of parsed.drops) this.logger.warn(describeTraitDrop(drop));
 
       const link = this.identity.setUser(id);
-      if (link === 'rebind') {
+      if (link === 'rebind' && this.stores.persistent) {
         this.logger.warn(
           `identify("${id}"): this device is already linked to another user and the server keeps the first link. Call reset() on logout so the next person gets a new device id.`,
         );
       }
 
       const hasOps = Object.keys(parsed.set).length + Object.keys(parsed.setOnce).length + parsed.unset.length > 0;
-      if (link === 'known' && !hasOps) {
-        this.logger.debug(`identify("${id}"): link already sent and no traits given; nothing to send`);
+      // Cookieless there is no device to link: the user id rides on every event from this page.
+      if ((link === 'known' || !this.stores.persistent) && !hasOps) {
+        this.logger.debug(`identify("${id}"): no link to send and no traits given; nothing to send`);
 
         return;
       }
 
-      const entry: Record<string, unknown> = { user_id: id, device_id: this.identity.deviceId };
+      const entry: Record<string, unknown> = { user_id: id };
+      if (this.stores.persistent) entry['device_id'] = this.identity.deviceId;
       if (Object.keys(parsed.set).length > 0) entry['$set'] = parsed.set;
       if (Object.keys(parsed.setOnce).length > 0) entry['$set_once'] = parsed.setOnce;
       if (parsed.unset.length > 0) entry['$unset'] = parsed.unset;
@@ -632,8 +714,7 @@ export class Vinktar {
       level: isLevel(level) ? level : 'error',
       exceptions,
       mechanism: { type: mechanism, handled, synthetic },
-      device_id: this.identity.deviceId,
-      session_id: this.identity.peekSessionId(),
+      ...(this.stores.persistent ? { device_id: this.identity.deviceId, session_id: this.identity.peekSessionId() } : {}),
       environment: this.o.environment,
       context: normalize({ ...pageContext(this.o), ...this.context, ...(hint.context ?? {}) }, this.normalizeOptions),
     };
@@ -763,12 +844,13 @@ export class Vinktar {
 
   // Ids -----------------------------------------------------------------------------------------
 
+  /** Empty when cookieless: there is no device id, and none is sent. */
   getDeviceId(): string {
-    return this.identity.deviceId;
+    return this.stores.persistent ? this.identity.deviceId : '';
   }
 
   getSessionId(): string {
-    return this.inert !== null ? '' : this.identity.peekSessionId();
+    return this.inert !== null || !this.stores.persistent ? '' : this.identity.peekSessionId();
   }
 
   getUserId(): string | null {
@@ -932,54 +1014,53 @@ export class Vinktar {
   }
 
   /**
-   * `pagehide` (leaving) or `visibilitychange` to hidden (maybe coming back).
+   * `visibilitychange` to hidden, then `pagehide` if the page is really going.
    *
-   * The persisted copy is written FIRST: it is what survives if the send does not. A keepalive
-   * request can still report its answer when the page stays alive, so its records are removed
-   * only on a 2xx. A beacon reports nothing, so its records are removed only when the page is
-   * really leaving; a tab that is merely hidden keeps them and sends them normally later.
+   * The persisted copy is written FIRST: it is what survives if the send does not. A beacon's
+   * records leave the queue at once, because a beacon never answers; its persisted copy stays for
+   * the next page, which the server deduplicates by event id. A keepalive request's records leave
+   * the queue on its 2xx, and until then a `pagehide` does not send them a second time.
    */
-  private onUnload(leaving: boolean): void {
+  private onUnload(): void {
     this.guarded(() => {
       if (this.closed || this.inert !== null) return;
-      this.identity.flushSession();
-      if (this.o.autoPageviews.leave) this.pageLeave();
+      if (this.stores.persistent) this.identity.flushSession();
+      this.engage();
       if (!this.identity.allowed || this.dispatcher.isStopped) return;
       this.persist(true);
-      const requests = this.dispatcher.buildAll();
-      requests.forEach(({ out, entries }, index) => this.sendUnload(out.endpoint, entries, index === 0, leaving));
+      const requests = this.dispatcher.buildAll(this.handedOff);
+      for (const { out, entries } of requests) this.sendUnload(out, entries);
       // Nothing queued, but drops counted: the last chance to send those counts from this page.
-      if (requests.length === 0 && !this.dispatcher.reports.isEmpty) this.sendUnload('/v1/batch', [], true, leaving);
+      if (requests.length === 0 && !this.dispatcher.reports.isEmpty) this.sendUnload(this.dispatcher.buildRequest('/v1/batch', [], true), []);
     });
   }
 
-  /** Keepalive or beacon what fits; halve what does not; give up under the floor. */
-  private sendUnload(endpoint: Endpoint, entries: readonly Entry[], withReport: boolean, leaving: boolean): void {
-    const queue = endpoint === '/v1/errors' ? this.dispatcher.errors : this.dispatcher.events;
-    const out = this.dispatcher.buildRequest(endpoint, entries, withReport);
-    const result = this.transport.sendOnUnload(
-      out,
-      () => {
-        // Answered while the page was still here: exactly these records, wherever they are now.
-        queue.remove(entries);
-        this.dispatcher.commitReport(out);
-        this.persist();
-      },
-      leaving,
-    );
-    if (result === 'sent') return;
+  /** Beacon or keepalive what fits; halve what does not; give up under the floor. */
+  private sendUnload(out: Outbound, entries: readonly Entry[]): void {
+    const queue = out.endpoint === '/v1/errors' ? this.dispatcher.errors : this.dispatcher.events;
+    const result = this.transport.sendOnUnload(out, (accepted) => {
+      for (const entry of entries) this.handedOff.delete(entry);
+      if (!accepted) return;
+      // Answered while the page was still here: exactly these records, wherever they are now.
+      queue.remove(entries);
+      this.dispatcher.commitReport(out);
+      this.persist();
+    });
+    if (result === 'sent') {
+      for (const entry of entries) this.handedOff.add(entry);
+
+      return;
+    }
     if (result === 'beacon') {
-      if (leaving) {
-        queue.remove(entries);
-        this.dispatcher.commitReport(out);
-      }
+      queue.remove(entries);
+      this.dispatcher.commitReport(out);
 
       return;
     }
     if (result === 'too_large' && entries.length > 1) {
       const half = Math.ceil(entries.length / 2);
-      this.sendUnload(endpoint, entries.slice(0, half), withReport, leaving);
-      this.sendUnload(endpoint, entries.slice(half), false, leaving);
+      this.sendUnload(this.dispatcher.buildRequest(out.endpoint, entries.slice(0, half), out.reportTaken !== undefined), entries.slice(0, half));
+      this.sendUnload(this.dispatcher.buildRequest(out.endpoint, entries.slice(half)), entries.slice(half));
     }
     // 'refused': the browser's quota is spent. The persisted copy goes out with the next page.
   }
@@ -1021,23 +1102,39 @@ export class Vinktar {
     });
   }
 
-  private noteScroll(): void {
-    const win = natives.window!;
-    const doc = natives.document!;
-    const height = Math.max(doc.documentElement?.scrollHeight ?? 0, doc.body?.scrollHeight ?? 0) - win.innerHeight;
-    if (height <= 0) {
-      this.pageMaxScroll = 100;
-
-      return;
-    }
-    this.pageMaxScroll = Math.max(this.pageMaxScroll, Math.min(100, Math.round((win.scrollY / height) * 100)));
+  /**
+   * Bank the visible time since the last send and send it as an increment, with the deepest scroll
+   * so far. Called on every hide, before every pageview, and on `pagehide`. A zero is never sent:
+   * a second hide with nothing visible in between has nothing to say.
+   */
+  private engage(): void {
+    const view = this.view;
+    if (view === null || !this.o.engagement) return;
+    const now = Date.now();
+    if (view.since > 0) view.engaged += Math.max(0, now - view.since);
+    view.since = natives.document?.visibilityState === 'visible' ? now : 0;
+    const ms = Math.min(Math.round(view.engaged), MAX_ENGAGED_MS);
+    if (ms <= 0) return;
+    view.engaged = 0;
+    this.measure();
+    this.noteScroll();
+    // The URL of the page it measured: on a route change the location has already moved on.
+    this.record('$engagement', { $pageview_id: view.id, $engaged_ms: ms, $scroll_depth: view.scroll }, undefined, { $current_url: view.url });
   }
 
-  private pageLeave(): void {
-    if (this.pageStarted === 0) return;
-    const duration = Date.now() - this.pageStarted;
-    this.pageStarted = 0;
-    this.track('$pageleave', { $duration_ms: duration, $scroll_depth: this.pageMaxScroll });
+  /** How much of the page has been on screen, in percent: 100 for a page that fits the viewport. */
+  private noteScroll(): void {
+    const view = this.view;
+    const win = natives.window;
+    if (view === null || win === undefined) return;
+    const depth = this.docHeight <= win.innerHeight ? 100 : Math.min(100, Math.round(((win.scrollY + win.innerHeight) / this.docHeight) * 100));
+    if (depth > view.scroll) view.scroll = depth;
+  }
+
+  private measure(): void {
+    const body = natives.document?.body;
+    const root = natives.document?.documentElement;
+    this.docHeight = Math.max(body?.scrollHeight ?? 0, body?.offsetHeight ?? 0, body?.clientHeight ?? 0, root?.scrollHeight ?? 0, root?.offsetHeight ?? 0, root?.clientHeight ?? 0);
   }
 
   /** Every public method's body runs in here. Whatever it throws is reported and the caller gets `fallback`. */
@@ -1052,6 +1149,27 @@ export class Vinktar {
     } catch {
       // The customer's handler threw. Nothing more can be done about that here.
     }
+  }
+}
+
+/** How this document was reached: `navigate`, `reload`, `back_forward` or `prerender`. */
+function loadType(): string {
+  try {
+    const nav = performance.getEntriesByType('navigation')[0] as (PerformanceNavigationTiming & { activationStart?: number }) | undefined;
+    if (nav === undefined) return 'navigate';
+
+    return (nav.activationStart ?? 0) > 0 ? 'prerender' : nav.type;
+  } catch {
+    return 'navigate';
+  }
+}
+
+/** The owner's own browser, excluded without code: `localStorage.vinktar_ignore = 'true'`. */
+function ignoredBrowser(): boolean {
+  try {
+    return natives.window?.localStorage.getItem('vinktar_ignore') === 'true';
+  } catch {
+    return false;
   }
 }
 

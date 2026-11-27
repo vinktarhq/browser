@@ -75,3 +75,103 @@ export function installAutocapture(instrumentation: Instrumentation, options: Au
     );
   }
 }
+
+/**
+ * Events from markup and links, through one delegated capture-phase listener per event type, so
+ * links a framework renders later count, and a handler that stops propagation does not hide one.
+ * Nothing here delays or cancels a navigation.
+ *
+ * Always on: `data-vinktar-event="name"` fires `name` on click, or on submit for a form, with each
+ * `data-vinktar-prop-<key>="value"` as a property. With `auto`: `link_clicked` for outbound,
+ * `mailto:` and `tel:` links, `file_downloaded` for a link to a file, `form_submitted` for any
+ * other form. Never link text, an address or a field value unless PII is allowed.
+ */
+export interface DomEventOptions {
+  readonly auto: boolean;
+  readonly sendDefaultPii: boolean;
+  readonly track: (name: string, properties: Props) => void;
+}
+
+const DOWNLOAD = /\.(pdf|csv|docx?|xlsx?|pptx?|zip|rar|7z|dmg|exe|msi|apk|mp3|mp4|mov|txt|json|xml|key|numbers|pages)$/i;
+const TAG = 'data-vinktar-event';
+const PROP = 'data-vinktar-prop-';
+
+export function installDomEvents(instrumentation: Instrumentation, options: DomEventOptions): void {
+  const doc = natives.document;
+  if (doc === undefined) return;
+
+  const onClick = (event: Event): void => {
+    // `auxclick` is any button but the primary; only the middle one opens a link.
+    if (event.type === 'auxclick' && (event as MouseEvent).button !== 1) return;
+    const target = eventTarget(event);
+    if (target === null) return;
+    const tagged = target.closest(`[${TAG}]`);
+    // A tagged form counts on submit, not for every click inside it.
+    if (tagged !== null && !(tagged instanceof HTMLFormElement)) return declared(tagged, options);
+    if (!options.auto) return;
+    // `instanceof` also skips an `<a>` inside SVG, whose `href` is not a string.
+    const link = target.closest('a[href]');
+    if (link instanceof HTMLAnchorElement) linkEvent(link, options);
+  };
+  instrumentation.listen(doc, 'click', onClick, { capture: true, passive: true });
+  instrumentation.listen(doc, 'auxclick', onClick, { capture: true, passive: true });
+
+  instrumentation.listen(
+    doc,
+    'submit',
+    (event) => {
+      const form = event.target;
+      if (!(form instanceof HTMLFormElement)) return;
+      if (attribute(form, TAG) !== null) return declared(form, options);
+      if (!options.auto) return;
+      const props: Props = {};
+      // Attributes, not properties: a control named `id` or `action` shadows the property.
+      const id = attribute(form, 'id');
+      if (id) props['form_id'] = id;
+      const name = attribute(form, 'name');
+      if (name) props['form_name'] = name;
+      const action = attribute(form, 'action');
+      if (action) props['form_action'] = pathOf(resolveUrl(action));
+      options.track('form_submitted', props);
+    },
+    { capture: true, passive: true },
+  );
+}
+
+function declared(element: Element, options: DomEventOptions): void {
+  const name = (attribute(element, TAG) ?? '').trim();
+  if (name === '') return;
+  const props: Props = {};
+  for (const { name: attr, value } of Array.from(element.attributes)) {
+    if (attr.startsWith(PROP) && attr.length > PROP.length) props[attr.slice(PROP.length).replace(/-/g, '_')] = value;
+  }
+  options.track(name, props);
+}
+
+function linkEvent(link: HTMLAnchorElement, options: DomEventOptions): void {
+  let url: URL;
+  try {
+    url = new URL(link.href);
+  } catch {
+    return;
+  }
+  const pii = options.sendDefaultPii ? { url: url.href } : {};
+  if (url.protocol === 'mailto:') {
+    options.track('link_clicked', { kind: 'mailto', host: (url.pathname.split('@')[1] ?? '').split(',')[0]!.toLowerCase(), ...pii });
+  } else if (url.protocol === 'tel:') {
+    options.track('link_clicked', { kind: 'tel', ...pii });
+  } else if (url.protocol === 'http:' || url.protocol === 'https:') {
+    // The pathname, so neither a query nor `#page=2` hides the extension.
+    const file = DOWNLOAD.exec(url.pathname);
+    if (file !== null) options.track('file_downloaded', { url: stripUrl(url.href, options.sendDefaultPii), extension: file[1]!.toLowerCase() });
+    else if (url.host !== natives.window?.location.host) options.track('link_clicked', { kind: 'outbound', url: stripUrl(url.href, options.sendDefaultPii), host: url.hostname });
+  }
+}
+
+function pathOf(href: string): string {
+  try {
+    return new URL(href).pathname;
+  } catch {
+    return href.split(/[?#]/)[0] ?? href;
+  }
+}

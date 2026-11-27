@@ -101,6 +101,10 @@ export class Queue {
     this.trim();
   }
 
+  isLeased(entry: Entry): boolean {
+    return this.leased.has(entry);
+  }
+
   /** Remove exactly these entries, wherever they are now. Entries already gone are ignored. */
   remove(entries: readonly Entry[]): void {
     if (entries.length === 0) return;

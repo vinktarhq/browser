@@ -113,9 +113,9 @@ export async function startIngest(): Promise<Ingest> {
  * The customer's site: the page and the bundle, on its own origin. With E2E_SAME_ORIGIN=1 the page
  * is served by ingest instead, which is how the suite compares an engine's behaviour across the two.
  */
-export async function startSite(ingestUrl: string, extra = '', ingest?: Ingest): Promise<Site> {
+export async function startSite(ingestUrl: string, extra = '', ingest?: Ingest, attributes = ''): Promise<Site> {
   if (process.env['E2E_SAME_ORIGIN'] === '1' && ingest !== undefined) {
-    ingest.host(pageHtml(ingestUrl, ingestUrl, extra));
+    ingest.host(pageHtml(ingestUrl, ingestUrl, extra, attributes));
 
     return { url: ingestUrl, close: async () => {} };
   }
@@ -127,7 +127,7 @@ export async function startSite(ingestUrl: string, extra = '', ingest?: Ingest):
 
       return;
     }
-    res.writeHead(200, { 'Content-Type': 'text/html' }).end(pageHtml(origin, ingestUrl, extra));
+    res.writeHead(200, { 'Content-Type': 'text/html' }).end(pageHtml(origin, ingestUrl, extra, attributes));
   });
   const address = await listen(server, '127.0.0.1');
   // Same socket, a different host name: a different site as far as the browser is concerned, as a
@@ -155,8 +155,8 @@ function body(req: IncomingMessage): Promise<Buffer> {
 }
 
 /** The test page: the bundle from the site, auto-initialised against the ingest origin. */
-function pageHtml(site: string, ingest: string, extra: string): string {
+function pageHtml(site: string, ingest: string, extra: string, attributes: string): string {
   return `<!doctype html><html><head><title>e2e</title>
-<script src="${site}/vinktar.min.js" data-key="vnk_pk_e2e" data-host="${ingest}" data-filter-bots="false" data-debug></script>
+<script src="${site}/vinktar.min.js" data-key="vnk_pk_e2e" data-host="${ingest}" data-filter-bots="false" data-debug ${attributes}></script>
 </head><body><h1>e2e</h1><button id="buy">Buy</button>${extra}</body></html>`;
 }

@@ -39,8 +39,19 @@ const PERSISTENT = 'data-persistence="localStorage"';
 const events = (received: Received[]): Array<Record<string, unknown>> =>
   received.flatMap((r) => (r.body['batch'] as Array<Record<string, unknown>> | undefined) ?? []);
 
-test('sends a cookieless pageview on load, cross-origin, without a preflight', async ({ page, context }) => {
+test('keeps the ids in a first-party cookie by default and sends them', async ({ page, context }) => {
   await open(page);
+  const [first] = await ingest.waitFor((r) => r.length >= 1);
+  const batch = first!.body['batch'] as Array<Record<string, unknown>>;
+  const device = await page.evaluate(() => (window as unknown as { vinktar: Global }).vinktar.getDeviceId());
+  expect(batch[0]!['name']).toBe('$pageview');
+  expect(batch[0]!['device_id']).toBe(device);
+  const cookies = await context.cookies();
+  expect(cookies.some((c) => c.value.includes(device) && site.url.includes(c.domain))).toBe(true);
+});
+
+test('sends a cookieless pageview on load, cross-origin, without a preflight', async ({ page, context }) => {
+  await open(page, '', 'data-persistence="memory"');
   const [first] = await ingest.waitFor((r) => r.length >= 1);
   expect(first!.path).toBe('/v1/batch');
   expect(first!.beacon).toBe(true); // the key in the query string

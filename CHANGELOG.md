@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.4.0
+
+Web analytics that count what a visitor actually saw, and a cookieless mode beside them. One change
+needs action when upgrading: `$pageleave` becomes `$engagement`, read "Changed".
+
+### Changed
+
+- **The device, user, session and consent now live in a first-party cookie**, and everything else
+  stays in localStorage: `persistence: 'localStorage+cookie'`, the new default. A visitor whose ids
+  0.3 kept in localStorage keeps them; they are copied into the cookie the first time they are read.
+  `persistence: 'localStorage'` keeps 0.3's layout, with no cookie unless `crossSubdomainCookie`.
+- **`$pageleave` is replaced by `$engagement`, and it is on by default.** It is sent every time
+  the page is hidden and before every route change, with `$engaged_ms` (visible time since the
+  last one, an increment to sum, never 0, at most 30 minutes), `$scroll_depth` (the furthest seen,
+  in percent of the page) and `$pageview_id`. `autoPageviews: { leave }` is gone;
+  `engagement: false` turns the new event off. Queries on `$pageleave.$duration_ms` should move to
+  the sum of `$engagement.$engaged_ms` per `$pageview_id`.
+- The first pageview waits until the page is visible, so a prerendered page or a background tab
+  nobody looked at is not counted.
+- The referrer of a route change in a single-page app is the previous page, not the landing
+  referrer.
+- Uncompressed requests are sent as `text/plain` with the key in the query string, so they need no
+  CORS preflight. Compressed ones are unchanged.
+- When the page is hidden, the queue goes out with a beacon first, and `pagehide` no longer sends
+  the same records again.
+- The web-vitals entry uses Google's `web-vitals` library (attribution build), now a dependency,
+  and sends one `$web_vital` per report with `$metric_id`, `$navigation_type`, `$pageview_id` and
+  attribution: the element and the LCP subparts or INP phases. It is about 5.5 kB, up from 0.7 kB.
+- The main bundle is about 2 kB larger.
+
+### Added
+
+- `persistence` picks where the ids live: `'localStorage+cookie'` (default), `'cookie'`,
+  `'localStorage'`, or `'memory'`, which is cookieless: nothing is stored, no `device_id` or
+  `session_id` is sent, and the server counts visitors from a daily-salted hash and visits from 30
+  minutes of inactivity. `identify()` then lasts for the page and joins nothing before it.
+  `disablePersistence: true` is the same as `'memory'`. On the script tag, `data-persistence`.
+- `cookielessMode` for sites with a cookie banner. `'on_reject'` sends and stores nothing until the
+  visitor answers; `optIn()` stores ids as `persistence` says, and `optOut()` removes them and goes
+  on counting cookieless. `'always'` is cookieless whatever the answer. On the script tag,
+  `data-cookieless-mode`.
+
+- Every `$pageview` carries `$pageview_id` (its own `event_id`) and `$navigation_type`, including
+  `navigate`, `reload`, `back_forward` and `prerender` on the first one.
+- A page restored from the back/forward cache sends a pageview, `$navigation_type:
+  back_forward_cache`.
+- `autoEvents: true`: `link_clicked` (outbound, `mailto:`, `tel:`), `file_downloaded` and
+  `form_submitted`, with no link text, address or field value.
+- `data-vinktar-event` and `data-vinktar-prop-*` attributes send an event on click, or on submit
+  for a form, without code.
+- `page_not_found`, for a page with `data-vinktar-404` or a title matching `notFound`.
+- `localStorage.vinktar_ignore = 'true'` keeps a browser's analytics out, for your own visits.
+- `IntegrationHost.pageviewId(url?)`, so an integration can tie what it sends to a pageview.
+
+### Fixed
+
+- Cubot phones were dropped as bots because their user agent contains "bot". Cypress, PhantomJS
+  (`_phantom`, `callPhantom`), Nightmare and a `Math.random` that returns a constant are now
+  treated as automation.
+- The bundle loaded twice on one page (a tag in the theme and one in a tag manager) started two
+  clients and counted everything twice. The second copy now uses the first one's client.
+- A `replaceState` that changed the path before the first pageview was sent counted as a second
+  pageview.
+
 ## 0.3.2
 
 ### Fixed

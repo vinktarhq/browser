@@ -6,6 +6,7 @@ import { isObject, readOptions as readKnown, safeString } from './core/guard.js'
 import { toHookList } from './core/hooks.js';
 import type { Props } from './core/normalize.js';
 import { natives } from './browser/natives.js';
+import type { Persistence } from './browser/storage.js';
 import type { CrumbHook, EventHook, Integration } from './types.js';
 
 /**
@@ -51,11 +52,30 @@ export interface VinktarOptions {
   shutdownTimeout?: number;
   /** Compress bodies of 1 KiB and over. */
   gzip?: boolean;
-  /** Keep the queue in localStorage across navigations and crashes. */
+  /** Keep the queue in localStorage across navigations and crashes. Not with `persistence: 'cookie'` or `'memory'`. */
   persistQueue?: boolean;
+  /**
+   * Where the visitor's ids live. `'localStorage+cookie'` (the default) keeps the device, user and
+   * session in a first-party cookie and everything else in localStorage. `'cookie'` uses the cookie
+   * alone, `'localStorage'` localStorage alone. `'memory'` is cookieless: nothing is stored, no
+   * device or session id is sent, and the server counts visitors and visits itself.
+   */
+  persistence?: Persistence;
+  /**
+   * `'always'`: cookieless, whatever the visitor chooses. `'on_reject'`: nothing is sent until the
+   * visitor answers; `optIn()` stores ids as `persistence` says, and `optOut()` removes them and
+   * goes on counting cookieless. Unset, `optOut()` stops everything.
+   */
+  cookielessMode?: 'always' | 'on_reject';
 
   /** `$pageview` on load and on history changes. An object picks which URL parts count as a change. */
-  autoPageviews?: boolean | { path?: boolean; search?: boolean; hash?: boolean; leave?: boolean };
+  autoPageviews?: boolean | { path?: boolean; search?: boolean; hash?: boolean };
+  /** `$engagement` events: visible time and scroll depth per pageview. */
+  engagement?: boolean;
+  /** `link_clicked` (outbound, mailto, tel), `file_downloaded` and `form_submitted`. */
+  autoEvents?: boolean;
+  /** A `page_not_found` event when the document title matches. `data-vinktar-404` on the page does the same. */
+  notFound?: string | RegExp;
   /** `$autocapture` for clicks and form submits, element identity only. */
   autocapture?: boolean | { clicks?: boolean; forms?: boolean };
   /** Idle time before a new session starts. 30 minutes. */
@@ -88,7 +108,7 @@ export interface VinktarOptions {
   redactedKeys?: string[];
   /** Top-level property names dropped outright. */
   propertyDenylist?: string[];
-  /** Memory only: nothing written to cookies or storage. A new device id every load. */
+  /** The same as `persistence: 'memory'`. */
   disablePersistence?: boolean;
   /** Share the device and session across subdomains via a cookie on the registrable domain. */
   crossSubdomainCookie?: boolean;
@@ -140,7 +160,14 @@ export interface Resolved {
   readonly shutdownTimeout: number;
   readonly gzip: boolean;
   readonly persistQueue: boolean;
-  readonly autoPageviews: { enabled: boolean; path: boolean; search: boolean; hash: boolean; leave: boolean };
+  readonly persistence: Persistence;
+  readonly cookielessMode: 'always' | 'on_reject' | null;
+  /** `on_reject` with `optOutByDefault`, or with `respectDnt` and Do Not Track on: declined until `optIn()`. */
+  readonly declinedByDefault: boolean;
+  readonly autoPageviews: { enabled: boolean; path: boolean; search: boolean; hash: boolean };
+  readonly engagement: boolean;
+  readonly autoEvents: boolean;
+  readonly notFound: ReadonlyArray<string | RegExp>;
   readonly autocapture: { clicks: boolean; forms: boolean };
   readonly sessionTimeoutMs: number;
   readonly sessionMaxMs: number;
@@ -159,7 +186,6 @@ export interface Resolved {
   readonly sendDefaultPii: boolean;
   readonly redactedKeys: readonly string[];
   readonly propertyDenylist: readonly string[];
-  readonly disablePersistence: boolean;
   readonly crossSubdomainCookie: boolean;
   readonly useBeacon: boolean;
   readonly optOutByDefault: boolean;
@@ -181,12 +207,14 @@ export interface Resolved {
   readonly warnings: readonly string[];
 }
 
+const PERSISTENCE: readonly Persistence[] = ['localStorage+cookie', 'cookie', 'localStorage', 'memory'];
+
 export const DEFAULT_HOST = 'https://in.vinktar.com';
 
 const KNOWN = new Set<keyof VinktarOptions>([
   'writeKey', 'key', 'host', 'enabled', 'debug', 'analytics', 'errors', 'autoCaptureErrors', 'release', 'environment',
   'enabledEnvironments', 'flushAt', 'flushIntervalMs', 'maxQueueSize', 'requestTimeoutMs', 'shutdownTimeout', 'gzip', 'persistQueue',
-  'autoPageviews', 'autocapture', 'sessionTimeoutMs', 'sessionMaxMs', 'breadcrumbs', 'maxBreadcrumbs', 'sampleRate',
+  'persistence', 'cookielessMode', 'autoPageviews', 'engagement', 'autoEvents', 'notFound', 'autocapture', 'sessionTimeoutMs', 'sessionMaxMs', 'breadcrumbs', 'maxBreadcrumbs', 'sampleRate',
   'errorSampleRate', 'maxErrorsPerMinute', 'maxEventsPerMinute', 'dedupe', 'ignoreErrors', 'denyUrls', 'allowUrls',
   'disableErrorDefaults', 'superProperties', 'sendDefaultPii', 'redactedKeys', 'propertyDenylist', 'disablePersistence',
   'crossSubdomainCookie', 'useBeacon', 'optOutByDefault', 'respectDnt', 'filterBots', 'propagateIdentity', 'initialScope',
@@ -278,12 +306,25 @@ export function resolve(options: VinktarOptions, logger: Logger, broken?: string
   }
 
   const respectDnt = options.respectDnt ?? false;
-  if (respectDnt && doNotTrack()) inert ??= 'Do Not Track / Global Privacy Control is on and respectDnt is set';
+  const cookielessMode = options.cookielessMode === 'always' || options.cookielessMode === 'on_reject' ? options.cookielessMode : null;
+  if (options.cookielessMode !== undefined && cookielessMode === null) warn(`cookielessMode must be 'always' or 'on_reject'; ignored`);
+  const dnt = respectDnt && doNotTrack();
+  // With on_reject, Do Not Track is a "no": counted cookieless rather than not at all.
+  if (dnt && cookielessMode !== 'on_reject') inert ??= 'Do Not Track / Global Privacy Control is on and respectDnt is set';
 
   const initial: { tags?: unknown; context?: unknown } = isObject(options.initialScope) ? options.initialScope : {};
   const pageviews = options.autoPageviews ?? true;
   const autocapture = options.autocapture ?? false;
   const crumbs = options.breadcrumbs ?? true;
+  const known = PERSISTENCE.includes(options.persistence as Persistence);
+  if (options.persistence !== undefined && !known) {
+    warn(`persistence must be one of ${PERSISTENCE.map((p) => `'${p}'`).join(', ')}; using 'localStorage+cookie'`);
+  }
+  const persistence: Persistence =
+    options.disablePersistence === true ? 'memory' : known ? (options.persistence as Persistence) : 'localStorage+cookie';
+  if (persistence === 'memory' && (options.crossSubdomainCookie === true || (Array.isArray(options.propagateIdentity) && options.propagateIdentity.length > 0))) {
+    warn(`crossSubdomainCookie and propagateIdentity need the visitor's ids stored; ignored with persistence: 'memory'`);
+  }
   const maxValueBytes = clamp('maxValueBytes', options.maxValueBytes, 16, MAX_STRING_BYTES, MAX_STRING_BYTES);
 
   const resolved: Resolved = {
@@ -303,10 +344,16 @@ export function resolve(options: VinktarOptions, logger: Logger, broken?: string
     shutdownTimeout: clamp('shutdownTimeout', options.shutdownTimeout, 0, 60_000, 2_000),
     gzip: options.gzip ?? true,
     persistQueue: options.persistQueue ?? true,
+    persistence,
+    cookielessMode,
+    declinedByDefault: cookielessMode === 'on_reject' && ((options.optOutByDefault ?? false) || dnt),
     autoPageviews:
       typeof pageviews === 'object'
-        ? { enabled: true, path: pageviews.path ?? true, search: pageviews.search ?? false, hash: pageviews.hash ?? false, leave: pageviews.leave ?? false }
-        : { enabled: pageviews, path: true, search: false, hash: false, leave: false },
+        ? { enabled: true, path: pageviews.path ?? true, search: pageviews.search ?? false, hash: pageviews.hash ?? false }
+        : { enabled: pageviews, path: true, search: false, hash: false },
+    engagement: options.engagement ?? true,
+    autoEvents: options.autoEvents ?? false,
+    notFound: patterns('notFound', options.notFound === undefined ? undefined : [options.notFound]),
     autocapture:
       typeof autocapture === 'object'
         ? { clicks: autocapture.clicks ?? true, forms: autocapture.forms ?? true }
@@ -331,7 +378,6 @@ export function resolve(options: VinktarOptions, logger: Logger, broken?: string
     sendDefaultPii: options.sendDefaultPii ?? false,
     redactedKeys: strings('redactedKeys', options.redactedKeys),
     propertyDenylist: strings('propertyDenylist', options.propertyDenylist),
-    disablePersistence: options.disablePersistence ?? false,
     crossSubdomainCookie: options.crossSubdomainCookie ?? false,
     useBeacon: options.useBeacon ?? true,
     optOutByDefault: options.optOutByDefault ?? false,

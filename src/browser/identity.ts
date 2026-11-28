@@ -76,7 +76,7 @@ export class Identity {
 
     this.session = this.readSession();
 
-    const opt = this.stores.identity.get(this.k.opt);
+    const opt = this.stores.consent.get(this.k.opt);
     this.consentState = opt === '1' ? 'granted' : opt === '0' ? 'denied' : 'pending';
 
     const links = parseJson(this.stores.data.get(this.k.lnk));
@@ -136,7 +136,7 @@ export class Identity {
     const uid = this.stores.identity.get(this.k.uid);
     const user = typeof uid === 'string' && uid !== '' && !isBlockedId(uid) ? uid : null;
     const device = looksLikeId(did) ? did : this.device;
-    const opt = this.stores.identity.get(this.k.opt);
+    const opt = this.stores.consent.get(this.k.opt);
     const consent: Consent = opt === '1' ? 'granted' : opt === '0' ? 'denied' : 'pending';
     if (device === this.device && user === this.user && consent === this.consentState) return false;
 
@@ -242,8 +242,18 @@ export class Identity {
     return true;
   }
 
+  /** Remove every id this SDK stored, for a visitor who declined. */
+  erase(): void {
+    for (const key of Object.values(this.k)) {
+      this.stores.identity.remove(key);
+      this.stores.consent.remove(key);
+    }
+  }
+
   setConsent(granted: boolean): void {
     this.consentState = granted ? 'granted' : 'denied';
-    this.stores.identity.set(this.k.opt, granted ? '1' : '0');
+    // Cookieless, only an opt-out is remembered; a grant lasts for this page.
+    if (granted && !this.stores.persistent) this.stores.consent.remove(this.k.opt);
+    else this.stores.consent.set(this.k.opt, granted ? '1' : '0');
   }
 }

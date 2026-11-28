@@ -26,27 +26,44 @@ test.afterEach(async () => {
   await ingest.close();
 });
 
-async function open(page: Page, extra = ''): Promise<void> {
-  if (extra !== '') {
+async function open(page: Page, extra = '', attributes = ''): Promise<void> {
+  if (extra !== '' || attributes !== '') {
     await site.close();
-    site = await startSite(ingest.url, extra, ingest);
+    site = await startSite(ingest.url, extra, ingest, attributes);
   }
   await page.goto(`${site.url}/`);
 }
 
+const PERSISTENT = 'data-persistence="localStorage"';
+
 const events = (received: Received[]): Array<Record<string, unknown>> =>
   received.flatMap((r) => (r.body['batch'] as Array<Record<string, unknown>> | undefined) ?? []);
 
-test('sends a pageview on load, cross-origin, with the three allowed headers', async ({ page }) => {
+test('keeps the ids in a first-party cookie by default and sends them', async ({ page, context }) => {
   await open(page);
   const [first] = await ingest.waitFor((r) => r.length >= 1);
+  const batch = first!.body['batch'] as Array<Record<string, unknown>>;
+  const device = await page.evaluate(() => (window as unknown as { vinktar: Global }).vinktar.getDeviceId());
+  expect(batch[0]!['name']).toBe('$pageview');
+  expect(batch[0]!['device_id']).toBe(device);
+  const cookies = await context.cookies();
+  expect(cookies.some((c) => c.value.includes(device) && site.url.includes(c.domain))).toBe(true);
+});
+
+test('sends a cookieless pageview on load, cross-origin, without a preflight', async ({ page, context }) => {
+  await open(page, '', 'data-persistence="memory"');
+  const [first] = await ingest.waitFor((r) => r.length >= 1);
   expect(first!.path).toBe('/v1/batch');
-  expect(first!.headers['x-vinktar-key']).toBe('vnk_pk_e2e');
+  expect(first!.beacon).toBe(true); // the key in the query string
+  expect(first!.headers['x-vinktar-key']).toBeUndefined();
   expect(first!.headers['origin']).toBe(site.url);
-  expect(ingest.preflights()).toBeGreaterThan(0);
+  expect(ingest.preflights()).toBe(0);
   const batch = first!.body['batch'] as Array<Record<string, unknown>>;
   expect(batch[0]!['name']).toBe('$pageview');
+  expect(batch[0]!['device_id']).toBeUndefined();
   expect((batch[0]!['context'] as Record<string, unknown>)['$lib']).toBe('vinktar-browser');
+  expect(await page.evaluate(() => [localStorage.length, sessionStorage.length, document.cookie])).toEqual([0, 0, '']);
+  expect(await context.cookies()).toEqual([]);
 });
 
 test('compresses a large batch and the server can read it', async ({ page }) => {
@@ -80,15 +97,20 @@ test('reports an uncaught error with crash-last frames and a click breadcrumb', 
   expect(crumbs.some((c) => c.category === 'ui.click' && c.message.includes('button#buy'))).toBe(true);
 });
 
-test('delivers what is queued when the page is closed', async ({ page, context }) => {
+test('delivers what is queued, and the time on the page, when the page is closed', async ({ page, context }) => {
   await open(page);
   await ingest.waitFor((r) => r.length >= 1);
   await page.evaluate(() => {
     (window as unknown as { vinktar: Global }).vinktar.track('last words');
   });
+  await page.waitForTimeout(200);
   await page.close();
-  const received = await ingest.waitFor((r) => events(r).some((e) => e['name'] === 'last words'));
-  expect(received.length).toBeGreaterThanOrEqual(2);
+  const received = await ingest.waitFor((r) => events(r).some((e) => e['name'] === 'last words') && events(r).some((e) => e['name'] === '$engagement'));
+  const pageview = events(received).find((e) => e['name'] === '$pageview')!;
+  const engagement = events(received).find((e) => e['name'] === '$engagement')!['payload'] as Record<string, unknown>;
+  expect(engagement['$pageview_id']).toBe(pageview['event_id']);
+  expect(engagement['$engaged_ms']).toBeGreaterThan(0);
+  expect(events(received).filter((e) => e['name'] === 'last words')).toHaveLength(1);
   await context.close();
 });
 
@@ -120,7 +142,7 @@ test('one pageview per real navigation in a single-page app', async ({ page }) =
 
 test('keeps a batch the server did not store and sends it after a reload', async ({ page }) => {
   ingest.respond({ status: 503, body: { error: 'storage_unavailable' }, headers: { 'Retry-After': '10' } });
-  await open(page);
+  await open(page, '', PERSISTENT);
   const [refused] = await ingest.waitFor((r) => r.length >= 1);
   expect(refused!.status).toBe(503);
   const lost = (refused!.body['batch'] as Array<{ event_id: string }>)[0]!.event_id;
@@ -137,6 +159,8 @@ test('keeps a batch the server did not store and sends it after a reload', async
 });
 
 test('a logout in one tab is adopted by the other tabs', async ({ context }) => {
+  await site.close();
+  site = await startSite(ingest.url, '', ingest, PERSISTENT);
   const first = await context.newPage();
   const second = await context.newPage();
   await first.goto(`${site.url}/`);
@@ -160,7 +184,7 @@ test('a logout in one tab is adopted by the other tabs', async ({ context }) => 
 });
 
 test('close resolves with whether the last delivery was accepted', async ({ page }) => {
-  await open(page);
+  await open(page, '', PERSISTENT);
   await ingest.waitFor((r) => r.length >= 1);
   ingest.respond({ status: 503, body: { error: 'storage_unavailable' }, headers: { 'Retry-After': '10' } });
   const refused = await page.evaluate(() => {

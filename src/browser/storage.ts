@@ -39,16 +39,18 @@ export function memoryStore(): Store {
 
 const PROBE = '__vk_probe__';
 
-function webStore(kind: 'local' | 'session'): Store | null {
+function webStore(kind: 'local' | 'session', probe = true): Store | null {
   let backing: globalThis.Storage;
   try {
     // Reading `window.localStorage` itself throws in a sandboxed frame.
     const candidate = kind === 'local' ? natives.window?.localStorage : natives.window?.sessionStorage;
     if (candidate === undefined || candidate === null) return null;
     backing = candidate;
-    backing.setItem(PROBE, '1');
-    if (backing.getItem(PROBE) !== '1') return null;
-    backing.removeItem(PROBE);
+    if (probe) {
+      backing.setItem(PROBE, '1');
+      if (backing.getItem(PROBE) !== '1') return null;
+      backing.removeItem(PROBE);
+    }
   } catch {
     return null;
   }
@@ -201,22 +203,56 @@ export function cookieDomain(hostname: string = natives.window?.location.hostnam
 }
 
 export interface Stores {
-  /** Device, user, session, consent. Small, and shared across subdomains when asked. */
+  /** False when cookieless: everything but an explicit opt-out lives in memory. */
+  readonly persistent: boolean;
+  /** Device, user, session. Small, and shared across subdomains when asked. */
   readonly identity: Store;
+  /** The opt-in/opt-out flag. The identity store, or localStorage unprobed when cookieless. */
+  readonly consent: Store;
   /** Queues, super properties, attribution. Never a cookie. */
   readonly data: Store;
   /** Per-tab: the tab id and the unloading flag. */
   readonly tab: Store;
 }
 
+export type Persistence = 'localStorage+cookie' | 'cookie' | 'localStorage' | 'memory';
+
 export interface StoreOptions {
-  readonly disablePersistence: boolean;
+  readonly persistence: Persistence;
   readonly crossSubdomainCookie: boolean;
   readonly onLarge?: (key: string, bytes: number) => void;
 }
 
+/**
+ * The cookie, falling back to what an earlier version left in localStorage: a visitor whose ids
+ * were stored there keeps them, copied into the cookie the first time they are read.
+ */
+function adopting(primary: Store, legacy: Store | null): Store {
+  if (legacy === null || legacy === primary) return primary;
+
+  return {
+    kind: primary.kind,
+    get: (key) => {
+      const own = primary.get(key);
+      if (own !== null) return own;
+      const old = legacy.get(key);
+      if (old !== null) primary.set(key, old);
+
+      return old;
+    },
+    set: (key, value) => primary.set(key, value),
+    remove: (key) => {
+      primary.remove(key);
+      legacy.remove(key);
+    },
+    keys: (prefix) => [...new Set([...primary.keys(prefix), ...legacy.keys(prefix)])],
+  };
+}
+
 export function createStores(options: StoreOptions): Stores {
-  if (options.disablePersistence) return { identity: memoryStore(), data: memoryStore(), tab: memoryStore() };
+  if (options.persistence === 'memory') {
+    return { persistent: false, identity: memoryStore(), consent: webStore('local', false) ?? memoryStore(), data: memoryStore(), tab: memoryStore() };
+  }
 
   const local = webStore('local');
   const session = webStore('session');
@@ -229,13 +265,34 @@ export function createStores(options: StoreOptions): Stores {
       ...(options.onLarge ? { onLarge: options.onLarge } : {}),
     });
 
-  const identity = (options.crossSubdomainCookie ? cookie() ?? local : local ?? cookie()) ?? memoryStore();
+  // Device, user, session and consent live in a first-party cookie unless localStorage was asked for.
+  const jar = options.persistence === 'localStorage' && !options.crossSubdomainCookie ? null : cookie();
+  const identity =
+    options.persistence === 'localStorage'
+      ? ((options.crossSubdomainCookie ? jar ?? local : local ?? jar) ?? memoryStore())
+      : jar !== null
+        ? adopting(jar, local)
+        : (local ?? memoryStore());
 
   return {
+    persistent: true,
     identity,
-    data: local ?? memoryStore(),
+    consent: identity,
+    // Queues, super properties and attribution are never a cookie; `cookie` keeps them in memory.
+    data: options.persistence === 'cookie' ? memoryStore() : (local ?? memoryStore()),
     tab: session ?? memoryStore(),
   };
+}
+
+/** A stored value from any store, read without probing or writing: for the visitor's earlier answer. */
+export function peekStored(key: string): string | null {
+  const fromCookie = readCookie(key);
+  if (fromCookie !== null) return fromCookie;
+  try {
+    return natives.window?.localStorage.getItem(key) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /** Reset the cookie-domain cache, for tests that change the hostname. */

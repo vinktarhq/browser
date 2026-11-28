@@ -13,6 +13,11 @@ import { natives } from './natives.js';
  * Anything else fails the CORS preflight, the failure is cached for a day, and every send on the
  * page dies with it. SDK identity rides inside the body, in `context.$lib`.
  *
+ * **An uncompressed body is sent CORS-simple**: `text/plain`, no custom header, the key in the
+ * query string, so the first pageview needs no preflight. The server parses JSON regardless of
+ * the declared type and reads the key from `_k`. `Content-Encoding` is never safelisted, so a
+ * compressed body keeps the header form and pays for the preflight.
+ *
  * **Redirects are never followed.** `fetch` follows them by default and sends the body and the
  * write key to wherever `Location` points. An ingest host that redirects is misconfigured, and the
  * dispatcher stops on the 3xx this reports.
@@ -27,7 +32,7 @@ import { natives } from './natives.js';
  *
  * **`fetch(..., { keepalive })` has a shared 64 KiB in-flight budget** per page; over it, the
  * request is refused outright. So keepalive is used only for bodies under ~51 KiB with fewer than
- * fifteen in flight, and the unload path falls back to `sendBeacon` otherwise.
+ * fifteen in flight.
  *
  * **Third-party code patches `fetch`**, sometimes to throw synchronously. The SDK holds the
  * reference `natives.ts` took when it loaded and still wraps the call. That reference is only as
@@ -44,7 +49,7 @@ export interface BrowserTransportOptions {
   readonly useBeacon: boolean;
 }
 
-/** What an unload send came to. `sent` will still call back on a 2xx; `beacon` never can. */
+/** What an unload send came to. `sent` will still call back with its answer; `beacon` never can. */
 export type UnloadResult = 'sent' | 'beacon' | 'too_large' | 'refused';
 
 export const GZIP_THRESHOLD_BYTES = 1024;
@@ -89,7 +94,8 @@ export class BrowserTransport implements Transport {
     }, this.options.timeoutMs);
 
     try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json', 'X-Vinktar-Key': this.options.writeKey };
+      let headers: Record<string, string> = { 'Content-Type': 'text/plain' };
+      let url = this.simpleUrl(out.endpoint);
       let body: BodyInit = out.body;
       let bytes = byteLength(out.body);
 
@@ -98,7 +104,8 @@ export class BrowserTransport implements Transport {
         if (compressed !== null) {
           body = compressed as BodyInit;
           bytes = compressed.byteLength;
-          headers['Content-Encoding'] = 'gzip';
+          headers = { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip', 'X-Vinktar-Key': this.options.writeKey };
+          url = `${this.options.host}${out.endpoint}`;
         }
       }
 
@@ -107,7 +114,7 @@ export class BrowserTransport implements Transport {
       let response: Response;
       try {
         response = await Promise.race([
-          fetch(`${this.options.host}${out.endpoint}`, {
+          fetch(url, {
             method: 'POST',
             headers,
             body,
@@ -156,21 +163,24 @@ export class BrowserTransport implements Transport {
     }
   }
 
-  /**
-   * One attempt, synchronous, for `pagehide` and a hidden tab.
-   *
-   * A page that is **leaving** gets a beacon first: no answer could arrive anyway, and a beacon is
-   * what every engine delivers most reliably while a page goes away (WebKit drops a keepalive
-   * request there). A page that is merely **hidden** gets a keepalive request first, because it may
-   * still be alive to hear the answer, and then `onAccepted` is called on a 2xx. Each falls back to
-   * the other. A refusal at a body over the split floor means the payload is too big; under it,
-   * the page's quota is exhausted and halving will not help.
-   */
-  sendOnUnload(out: Outbound, onAccepted?: () => void, leaving = false): UnloadResult {
-    const size = byteLength(out.body);
-    const url = `${this.options.host}${out.endpoint}?_k=${encodeURIComponent(this.options.writeKey)}`;
+  private simpleUrl(endpoint: string): string {
+    return `${this.options.host}${endpoint}?_k=${encodeURIComponent(this.options.writeKey)}`;
+  }
 
-    if (leaving && this.beacon(url, out.body)) return 'beacon';
+  /**
+   * One attempt, synchronous, for a tab going hidden and for `pagehide`.
+   *
+   * A beacon first: a hidden tab may never run again (mobile browsers kill it, a closed tab fires
+   * nothing after this), and a beacon is what every engine delivers most reliably while a page goes
+   * away. A keepalive request is the fallback, and `onAnswer` is told whether it got a 2xx. A refusal at
+   * a body over the split floor means the payload is too big; under it, the page's quota is
+   * exhausted and halving will not help.
+   */
+  sendOnUnload(out: Outbound, onAnswer?: (accepted: boolean) => void): UnloadResult {
+    const size = byteLength(out.body);
+    const url = this.simpleUrl(out.endpoint);
+
+    if (this.beacon(url, out.body)) return 'beacon';
 
     if (natives.fetch !== undefined && size <= KEEPALIVE_BODY_LIMIT && this.inFlight < KEEPALIVE_MAX_INFLIGHT) {
       try {
@@ -184,10 +194,13 @@ export class BrowserTransport implements Transport {
             mode: 'cors',
             redirect: 'manual',
           })
-          .then((response) => {
-            if (response.status >= 200 && response.status < 300) onAccepted?.();
-          })
-          .catch(markOwn);
+          .then(
+            (response) => onAnswer?.(response.status >= 200 && response.status < 300),
+            (error: unknown) => {
+              markOwn(error);
+              onAnswer?.(false);
+            },
+          );
 
         return 'sent';
       } catch {
@@ -195,7 +208,6 @@ export class BrowserTransport implements Transport {
       }
     }
 
-    if (!leaving && this.beacon(url, out.body)) return 'beacon';
     if (!this.options.useBeacon || natives.sendBeacon === undefined || natives.Blob === undefined) {
       return size > KEEPALIVE_BODY_LIMIT ? 'too_large' : 'refused';
     }

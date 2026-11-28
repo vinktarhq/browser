@@ -149,18 +149,22 @@ const BOT_UA =
   /bot|crawl|spider|slurp|headless|phantom|selenium|puppeteer|playwright|lighthouse|pingdom|gtmetrix|prerender|facebookexternalhit|ahrefs|semrush|bingpreview|yandex|duckduckbot|applebot|petalbot|bytespider|dataprovider|screaming frog|chrome-lighthouse|wappalyzer|hubspot|uptime|monitor/i;
 
 /**
- * Automated traffic, from three signals: the user agent string, the client-hint brands (which a
- * headless browser fills in honestly), and `navigator.webdriver`. No devtools sniffing: it
- * false-positives on every developer with the console open.
+ * Automated traffic: the user agent string, the client-hint brands (which a headless browser fills
+ * in honestly), `navigator.webdriver`, the globals test runners leave behind, and a `Math.random`
+ * that some bots replace with a constant. No devtools sniffing: it false-positives on every
+ * developer with the console open. Never `window.phantom`, which is a crypto wallet, and never
+ * "bot" inside "Cubot", which is a phone.
  */
 export function isLikelyBot(): boolean {
   const nav = natives.navigator as (Navigator & { userAgentData?: { brands?: Array<{ brand: string }> } }) | undefined;
   if (nav === undefined) return false;
-  if (nav.webdriver === true) return true;
-  if (BOT_UA.test(nav.userAgent ?? '')) return true;
+  const win = natives.window as (Window & Record<string, unknown>) | undefined;
+  if (nav.webdriver === true || win?.['Cypress'] || win?.['_phantom'] || win?.['callPhantom'] || win?.['__nightmare'] || Math.random() === Math.random()) return true;
+  const bot = (text: string): boolean => BOT_UA.test(text.replace(/cubot/gi, ''));
+  if (bot(nav.userAgent ?? '')) return true;
   try {
     for (const { brand } of nav.userAgentData?.brands ?? []) {
-      if (BOT_UA.test(brand)) return true;
+      if (bot(brand)) return true;
     }
   } catch {
     // Client hints are optional and occasionally throw in older builds.

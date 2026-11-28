@@ -15,6 +15,7 @@ afterEach(async () => {
   const w = window as Window & { vinktar?: { close?: () => Promise<void> } };
   await w.vinktar?.close?.();
   delete w.vinktar;
+  document.head.innerHTML = '';
   vi.unstubAllGlobals();
 });
 
@@ -34,6 +35,20 @@ describe('the CDN entry', () => {
     await api.flush();
     expect(harness.batches().map((e) => e['name'])).toEqual(['queued', 'after']);
     expect(String(api)).toMatch(/^vinktar\//);
+  });
+
+  it('starts one client when the bundle is loaded twice', async () => {
+    const script = document.createElement('script');
+    script.setAttribute('data-key', 'vnk_pk_cdn');
+    script.setAttribute('data-filter-bots', 'false');
+    document.head.appendChild(script);
+
+    await import('../src/global.js');
+    vi.resetModules();
+    await import('../src/global.js');
+    await tick(5);
+    await (window as Window & { vinktar?: { flush(): Promise<boolean> } }).vinktar!.flush();
+    expect(harness.batches().filter((e) => e['name'] === '$pageview')).toHaveLength(1);
   });
 
   it('reads typed options from data attributes', async () => {

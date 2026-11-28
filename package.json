@@ -1,6 +1,6 @@
 {
   "name": "@vinktarhq/browser",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Vinktar for the browser: product analytics and error tracking in one small bundle.",
   "keywords": [
     "vinktar",
@@ -71,5 +71,8 @@
   "publishConfig": {
     "access": "public",
     "provenance": true
+  },
+  "dependencies": {
+    "web-vitals": "^6.2.3"
   }
 }

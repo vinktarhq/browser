@@ -11,7 +11,8 @@ import { safeString, show } from './core/guard.js';
  * Calls made before `init()` are buffered (bounded, oldest dropped with a warning) and replayed
  * once it runs, so a `track()` fired from an early script or an `identify()` in a layout is not
  * lost to load order. A second `init()` warns and returns the first client; two clients on one
- * page would each patch the same globals.
+ * page would each patch the same globals and count every pageview twice. That holds across copies
+ * of the SDK too: a second bundle on the page uses the first one's client.
  *
  * Every function here forwards to a client method, and those never throw. `init()` does not throw
  * either: options it cannot use, a missing or a secret key included, leave an inert client and a
@@ -31,19 +32,30 @@ const MAX_PENDING = 100;
 type Pending = [method: string, args: unknown[]];
 const pending: Pending[] = [];
 
+// Shared by every copy of the SDK on the page: a script tag pasted twice, or a tag next to a bundle.
+const SHARED = '__vinktar_client__';
+const shared = natives.window as (Window & { [SHARED]?: Vinktar }) | undefined;
+
 export function init(options: VinktarOptions = {}): Vinktar {
   if (client !== null) {
     natives.console.warn('[vinktar] init() was called twice; the first client is kept');
 
     return client;
   }
-  try {
-    client = new Vinktar(options);
-  } catch (error) {
-    // The constructor guards everything it does. Should something get past that, the page still
-    // gets a client, one that does nothing.
-    natives.console.error(`[vinktar] init() failed, so nothing will be sent: ${safeString(error)}`);
-    client = new Vinktar({ enabled: false, logger: () => {} });
+  const other = shared?.[SHARED];
+  if (other !== undefined) {
+    natives.console.warn('[vinktar] the SDK is loaded twice on this page; the second copy uses the first one\'s client');
+    client = other;
+  } else {
+    try {
+      client = new Vinktar(options);
+    } catch (error) {
+      // The constructor guards everything it does. Should something get past that, the page still
+      // gets a client, one that does nothing.
+      natives.console.error(`[vinktar] init() failed, so nothing will be sent: ${safeString(error)}`);
+      client = new Vinktar({ enabled: false, logger: () => {} });
+    }
+    if (shared !== undefined) shared[SHARED] = client;
   }
   for (const [method, args] of pending.splice(0)) {
     (client as unknown as Record<string, (...a: unknown[]) => unknown>)[method]?.(...args);
@@ -171,6 +183,7 @@ export function flush(): Promise<boolean> {
 export function close(): Promise<boolean> {
   const current = client;
   client = null;
+  if (shared !== undefined && shared[SHARED] === current) delete shared[SHARED];
 
   return current?.close() ?? Promise.resolve(true);
 }

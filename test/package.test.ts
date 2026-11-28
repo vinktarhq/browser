@@ -10,8 +10,8 @@ describe('package.json', () => {
     expect(VERSION).toBe(manifest['version']);
   });
 
-  it('has zero runtime dependencies', () => {
-    expect(manifest['dependencies']).toBeUndefined();
+  it('has one runtime dependency, used only by the web-vitals entry', () => {
+    expect(Object.keys(manifest['dependencies'] as object)).toEqual(['web-vitals']);
     expect(manifest['peerDependencies']).toBeUndefined();
   });
 

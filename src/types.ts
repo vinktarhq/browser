@@ -43,6 +43,8 @@ export interface IntegrationHost {
   captureException(error: unknown, hint?: CaptureContext): string;
   addBreadcrumb(crumb: Partial<Breadcrumb>): void;
   readonly logger: { warn(message: string): void; debug(message: string): void };
+  /** The `$pageview_id` of the latest pageview at `url`, or of the current one. */
+  pageviewId(url?: string): string | undefined;
 }
 
 /** An opt-in capability. `setup` returns its teardown. */

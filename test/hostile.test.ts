@@ -281,6 +281,8 @@ function optionsFor(c: Case, variant: number): unknown {
     // happy-dom reports `navigator.webdriver`, so the bot filter would (correctly) drop every analytics event.
     filterBots: false,
     autoPageviews: false,
+    // The fixtures expect identify links, which need a device id.
+    persistence: 'localStorage',
     flushIntervalMs: 60_000,
     ...(writeKey === null ? {} : { writeKey: typeof writeKey === 'string' ? writeKey : KEY }),
     ...(hooks === 'allThrow' ? { beforeSend: throws, beforeTrack: throws, beforeBreadcrumb: throws } : {}),

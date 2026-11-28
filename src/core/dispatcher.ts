@@ -171,15 +171,19 @@ export class Dispatcher {
   }
 
   /**
-   * One request per queue, for an unload path where there is time for exactly one attempt. The
-   * caller's transport decides how (beacon, keepalive). Only the first request carries the client
+   * One request per queue, for an unload path where there is time for exactly one attempt, leaving
+   * out what is in flight and what `skip` says is already on its way. The caller's transport decides how (beacon,
+   * keepalive). Only the first request carries the client
    * report, so a page that sends several on the way out does not report the same drops several
    * times.
    */
-  buildAll(): Array<{ out: Outbound; entries: readonly Entry[] }> {
+  buildAll(skip: ReadonlySet<Entry> = new Set()): Array<{ out: Outbound; entries: readonly Entry[] }> {
     const all: Array<{ out: Outbound; entries: readonly Entry[] }> = [];
-    if (!this.errors.isEmpty) all.push({ out: this.build('/v1/errors', this.errors.peek(), all.length === 0), entries: this.errors.peek() });
-    if (!this.events.isEmpty) all.push({ out: this.build('/v1/batch', this.events.peek(), all.length === 0), entries: this.events.peek() });
+    for (const [endpoint, queue] of [['/v1/errors', this.errors], ['/v1/batch', this.events]] as const) {
+      // A leased entry is in a request already, and a small one goes with keepalive, which outlives the page.
+      const entries = queue.peek().filter((entry) => !skip.has(entry) && !queue.isLeased(entry));
+      if (entries.length > 0) all.push({ out: this.build(endpoint, entries, all.length === 0), entries });
+    }
 
     return all;
   }

@@ -593,3 +593,85 @@ describe('transport policy through the client', () => {
     await client.close();
   });
 });
+
+describe('cookielessMode', () => {
+  const clearCookies = (): void => document.cookie.split(';').forEach((c) => (document.cookie = `${c.split('=')[0]?.trim()}=; Max-Age=0; path=/`));
+  const CONSENT = { writeKey: KEY, logger, filterBots: false, useBeacon: false } as const;
+  beforeEach(clearCookies);
+
+  it('stores ids in a first-party cookie by default and sends them', async () => {
+    const client = make({ ...CONSENT });
+    await tick(5);
+    client.track('clicked');
+    await client.flush();
+    const clicked = harness.batches().find((e) => e['name'] === 'clicked')!;
+    expect(typeof clicked['device_id']).toBe('string');
+    expect(clicked['device_id']).toBe(client.getDeviceId());
+    expect(document.cookie).toContain(client.getDeviceId());
+  });
+
+  it("on_reject sends and stores nothing until the visitor answers, then stores ids on a yes", async () => {
+    const client = make({ ...CONSENT, cookielessMode: 'on_reject' });
+    await tick(5);
+    client.track('early');
+    await client.flush();
+    expect(harness.requests).toHaveLength(0);
+    expect([localStorage.length, document.cookie]).toEqual([0, '']);
+
+    client.optIn();
+    client.track('after');
+    await client.flush();
+    const sent = harness.batches();
+    expect(sent.map((e) => e['name'])).toEqual(['$pageview', 'after']);
+    for (const e of sent) expect(e['device_id']).toBe(client.getDeviceId());
+    expect(client.getDeviceId()).not.toBe('');
+    expect(document.cookie).toContain(client.getDeviceId());
+    expect(client.hasOptedOut()).toBe(false);
+  });
+
+  it('on_reject removes stored ids on a no and goes on counting cookieless, on this page and the next', async () => {
+    const first = make({ ...CONSENT, cookielessMode: 'on_reject' });
+    first.optIn();
+    await tick(5);
+    const device = first.getDeviceId();
+    expect(document.cookie).toContain(device);
+
+    first.optOut();
+    first.track('declined');
+    await first.flush();
+    expect(document.cookie).not.toContain(device);
+    expect(Object.values(localStorage)).toEqual(['0']);
+    const declined = harness.batches().find((e) => e['name'] === 'declined')!;
+    expect(declined['device_id']).toBeUndefined();
+    expect(first.hasOptedOut()).toBe(true);
+    await first.close();
+
+    harness.reset();
+    const next = make({ ...CONSENT, cookielessMode: 'on_reject' });
+    await tick(5);
+    await next.flush();
+    expect(harness.batches().map((e) => [e['name'], e['device_id']])).toEqual([['$pageview', undefined]]);
+  });
+
+  it('on_reject with optOutByDefault counts cookieless from the start', async () => {
+    const client = make({ ...CONSENT, cookielessMode: 'on_reject', optOutByDefault: true });
+    await tick(5);
+    await client.flush();
+    expect(harness.batches().map((e) => [e['name'], e['device_id']])).toEqual([['$pageview', undefined]]);
+    expect([localStorage.length, document.cookie]).toEqual([0, '']);
+  });
+
+  it('always is cookieless whatever the visitor chooses', async () => {
+    const client = make({ ...CONSENT, cookielessMode: 'always' });
+    client.optIn();
+    client.optOut();
+    await tick(5);
+    client.track('still');
+    await client.flush();
+    expect(harness.batches().map((e) => [e['name'], e['device_id']])).toEqual([
+      ['$pageview', undefined],
+      ['still', undefined],
+    ]);
+    expect(document.cookie).toBe('');
+  });
+});

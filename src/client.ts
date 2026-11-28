@@ -7,7 +7,7 @@ import { Instrumentation } from './browser/instrument.js';
 import { hasDom, natives } from './browser/natives.js';
 import { locationKey, Navigation } from './browser/navigation.js';
 import { QueuePersistence } from './browser/persist.js';
-import { createStores, type Stores } from './browser/storage.js';
+import { createStores, peekStored, type Persistence, type Stores } from './browser/storage.js';
 import { BrowserTransport } from './browser/transport.js';
 import { Breadcrumbs, toBreadcrumb, type Breadcrumb } from './core/breadcrumbs.js';
 import { validUserId } from './core/blocked.js';
@@ -75,11 +75,14 @@ export class Vinktar {
 
   private readonly o: Resolved;
   private readonly logger: Logger;
-  private readonly stores: Stores;
-  private readonly identity: Identity;
+  // Replaced when an on_reject visitor answers: the cookie on a yes, memory on a no.
+  private stores!: Stores;
+  private identity!: Identity;
+  /** on_reject before the visitor answers: nothing is sent and nothing is stored. */
+  private pending = false;
   private readonly dispatcher: Dispatcher;
   private readonly transport: BrowserTransport;
-  private readonly persistence: QueuePersistence | null;
+  private persistence: QueuePersistence | null = null;
   private readonly crumbs: Breadcrumbs;
   private readonly instrumentation: Instrumentation;
   private readonly navigation: Navigation;
@@ -132,17 +135,7 @@ export class Vinktar {
 
     const ns = namespaceFor(this.o.writeKey);
     this.keys = { sup: `${ns}_sup`, attr: `${ns}_attr` };
-    this.stores = createStores({
-      persistence: this.inert !== null ? 'memory' : this.o.persistence,
-      crossSubdomainCookie: this.o.crossSubdomainCookie,
-      onLarge: (key, bytes) => this.logger.warn(`the ${key} cookie is ${bytes} bytes; browsers drop cookies near 4 KiB`),
-    });
-    this.identity = new Identity(
-      this.stores,
-      this.o.writeKey,
-      { sessionTimeoutMs: this.o.sessionTimeoutMs, sessionMaxMs: this.o.sessionMaxMs, optOutByDefault: this.o.optOutByDefault },
-      this.logger,
-    );
+    this.useStores(this.initialPersistence(ns));
     this.errorValve = new Valve(this.o.maxErrorsPerMinute);
     this.eventValve = new Valve(this.o.maxEventsPerMinute);
     this.typeValve = new KeyedValve(Math.max(1, Math.floor(this.o.maxErrorsPerMinute / 2)));
@@ -174,16 +167,68 @@ export class Vinktar {
       onBilling: () => this.o.onError?.(new Error('vinktar: the monthly cap was reached; events are paused')),
     });
 
-    this.persistence =
-      this.o.persistQueue && this.inert === null && this.stores.data.kind !== 'memory'
-        ? new QueuePersistence(this.stores.data, this.stores.tab, ns, this.logger, Date.now, natives.setTimeout, natives.clearTimeout)
-        : null;
+    this.useQueuePersistence();
 
     if (this.inert !== null) return;
 
     // Everything below reaches into the page: storage, globals, listeners. A page that refuses one
     // of them costs that feature, never the constructor.
     this.guarded(() => this.start());
+  }
+
+  /** Where the ids live on this page: cookieless when asked, and for on_reject until a yes is stored. */
+  private initialPersistence(ns: string): Persistence {
+    if (this.inert !== null || this.o.cookielessMode === 'always') return 'memory';
+    if (this.o.cookielessMode === 'on_reject') {
+      const answer = peekStored(`${ns}_opt`);
+      this.pending = answer === null && !this.o.declinedByDefault;
+
+      return answer === '1' ? this.o.persistence : 'memory';
+    }
+
+    return this.o.persistence;
+  }
+
+  private useStores(persistence: Persistence): void {
+    this.stores = createStores({
+      persistence,
+      crossSubdomainCookie: this.o.crossSubdomainCookie,
+      onLarge: (key, bytes) => this.logger.warn(`the ${key} cookie is ${bytes} bytes; browsers drop cookies near 4 KiB`),
+    });
+    this.identity = new Identity(
+      this.stores,
+      this.o.writeKey,
+      {
+        sessionTimeoutMs: this.o.sessionTimeoutMs,
+        sessionMaxMs: this.o.sessionMaxMs,
+        // With a cookieless mode the client decides what may be sent; consent only records the answer.
+        optOutByDefault: this.o.cookielessMode === null ? this.o.optOutByDefault : false,
+      },
+      this.logger,
+    );
+  }
+
+  private useQueuePersistence(): void {
+    this.persistence =
+      this.o.persistQueue && this.inert === null && this.stores.data.kind !== 'memory'
+        ? new QueuePersistence(this.stores.data, this.stores.tab, namespaceFor(this.o.writeKey), this.logger, Date.now, natives.setTimeout, natives.clearTimeout)
+        : null;
+  }
+
+  /** The pageview held back while an on_reject visitor had not answered, sent once they do. */
+  private answeredPageview(): void {
+    if (!this.o.analytics || !this.o.autoPageviews.enabled || this.view === null) return;
+    // The view nobody was told about has no engagement to send and is no one's referrer.
+    this.view = null;
+    this.pageview(undefined, { $navigation_type: loadType() });
+  }
+
+  /** Whether anything may leave the page right now. */
+  private get sending(): boolean {
+    if (this.o.cookielessMode === 'always') return true;
+    if (this.o.cookielessMode === 'on_reject') return !this.pending;
+
+    return this.identity.allowed;
   }
 
   private start(): void {
@@ -822,23 +867,66 @@ export class Vinktar {
 
   optOut(): void {
     this.guarded(() => {
-      this.identity.setConsent(false);
+      if (this.o.cookielessMode === 'always') return void this.logger.debug('optOut() changes nothing: cookielessMode is always');
       // The visitor's own instruction, not a failure: nothing to report, and nowhere to report it.
       this.dispatcher.events.discardAll(null);
       this.dispatcher.errors.discardAll(null);
       this.persistence?.clear();
+      if (this.o.cookielessMode === 'on_reject') {
+        // A no removes what was stored and goes on counting cookieless; only the answer is kept.
+        const waited = this.pending;
+        this.pending = false;
+        if (this.stores.persistent) {
+          this.identity.erase();
+          this.stores.data.remove(this.keys.sup);
+          this.stores.data.remove(this.keys.attr);
+          this.useStores('memory');
+          this.useQueuePersistence();
+        }
+        this.identity.setConsent(false);
+        if (waited) this.answeredPageview();
+        this.logger.debug('declined: counting cookieless');
+
+        return;
+      }
+      this.identity.setConsent(false);
       this.logger.debug('opted out');
     });
   }
 
   optIn(): void {
     this.guarded(() => {
+      if (this.o.cookielessMode === 'always') return void this.logger.debug('optIn() changes nothing: cookielessMode is always');
+      if (this.o.cookielessMode === 'on_reject') {
+        const waited = this.pending;
+        this.pending = false;
+        const user = this.identity.userId;
+        if (!this.stores.persistent && this.o.persistence !== 'memory' && this.inert === null) {
+          this.stores.consent.remove(`${namespaceFor(this.o.writeKey)}_opt`);
+          this.useStores(this.o.persistence);
+          this.useQueuePersistence();
+          const stored = (parseJson(this.stores.data.get(this.keys.sup)) as Props | undefined) ?? {};
+          this.supers = { ...stored, ...this.supers };
+          const attribution = initialAttribution(this.stores.data, this.keys.attr, this.o.sendDefaultPii);
+          for (const [key, value] of Object.entries(attribution)) this.supers[key] ??= value;
+        }
+        this.identity.setConsent(true);
+        // A user identified before the answer is linked to the new device, so what follows joins them.
+        if (user !== null && this.stores.persistent) this.identify(user);
+        if (waited) this.answeredPageview();
+        this.scheduleFlush(0);
+        this.logger.debug('accepted: storing ids');
+
+        return;
+      }
       this.identity.setConsent(true);
       this.logger.debug('opted in');
     });
   }
 
   hasOptedOut(): boolean {
+    if (this.o.cookielessMode !== null) return this.identity.consent === 'denied';
+
     return !this.identity.allowed;
   }
 
@@ -867,7 +955,7 @@ export class Vinktar {
   flush(): Promise<boolean> {
     if (this.inert !== null) return Promise.resolve(true);
     if (this.closing !== null) return this.closing;
-    if (!this.identity.allowed) return Promise.resolve(true);
+    if (!this.sending) return Promise.resolve(true);
 
     return this.flushNow().catch((error: unknown) => {
       this.failed(error);
@@ -915,7 +1003,7 @@ export class Vinktar {
 
     let ok = true;
     try {
-      if (this.inert === null && this.identity.allowed) ok = await this.bounded(this.flushNow(), this.o.shutdownTimeout);
+      if (this.inert === null && this.sending) ok = await this.bounded(this.flushNow(), this.o.shutdownTimeout);
       if (!ok && this.dispatcher.pending > 0) {
         this.logger.warn(`close(): ${this.dispatcher.pending} record(s) were not delivered${this.persistence !== null ? '; they stay queued for the next page' : ''}`);
       }
@@ -973,7 +1061,7 @@ export class Vinktar {
 
       return false;
     }
-    if (!this.identity.allowed) {
+    if (!this.sending) {
       this.logger.debug(`${method}(): opted out`);
 
       return false;
@@ -1026,7 +1114,7 @@ export class Vinktar {
       if (this.closed || this.inert !== null) return;
       if (this.stores.persistent) this.identity.flushSession();
       this.engage();
-      if (!this.identity.allowed || this.dispatcher.isStopped) return;
+      if (!this.sending || this.dispatcher.isStopped) return;
       this.persist(true);
       const requests = this.dispatcher.buildAll(this.handedOff);
       for (const { out, entries } of requests) this.sendUnload(out, entries);

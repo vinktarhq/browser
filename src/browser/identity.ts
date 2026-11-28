@@ -242,6 +242,14 @@ export class Identity {
     return true;
   }
 
+  /** Remove every id this SDK stored, for a visitor who declined. */
+  erase(): void {
+    for (const key of Object.values(this.k)) {
+      this.stores.identity.remove(key);
+      this.stores.consent.remove(key);
+    }
+  }
+
   setConsent(granted: boolean): void {
     this.consentState = granted ? 'granted' : 'denied';
     // Cookieless, only an opt-out is remembered; a grant lasts for this page.

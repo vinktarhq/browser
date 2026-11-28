@@ -284,6 +284,17 @@ export function createStores(options: StoreOptions): Stores {
   };
 }
 
+/** A stored value from any store, read without probing or writing: for the visitor's earlier answer. */
+export function peekStored(key: string): string | null {
+  const fromCookie = readCookie(key);
+  if (fromCookie !== null) return fromCookie;
+  try {
+    return natives.window?.localStorage.getItem(key) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /** Reset the cookie-domain cache, for tests that change the hostname. */
 export function forgetCookieDomain(): void {
   cachedDomain = undefined;

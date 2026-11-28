@@ -28,7 +28,7 @@ needs action when upgrading: `$pageleave` becomes `$engagement`, read "Changed".
 - The web-vitals entry uses Google's `web-vitals` library (attribution build), now a dependency,
   and sends one `$web_vital` per report with `$metric_id`, `$navigation_type`, `$pageview_id` and
   attribution: the element and the LCP subparts or INP phases. It is about 5.5 kB, up from 0.7 kB.
-- The main bundle is about 1.6 kB larger.
+- The main bundle is about 2 kB larger.
 
 ### Added
 
@@ -37,6 +37,10 @@ needs action when upgrading: `$pageleave` becomes `$engagement`, read "Changed".
   `session_id` is sent, and the server counts visitors from a daily-salted hash and visits from 30
   minutes of inactivity. `identify()` then lasts for the page and joins nothing before it.
   `disablePersistence: true` is the same as `'memory'`. On the script tag, `data-persistence`.
+- `cookielessMode` for sites with a cookie banner. `'on_reject'` sends and stores nothing until the
+  visitor answers; `optIn()` stores ids as `persistence` says, and `optOut()` removes them and goes
+  on counting cookieless. `'always'` is cookieless whatever the answer. On the script tag,
+  `data-cookieless-mode`.
 
 - Every `$pageview` carries `$pageview_id` (its own `event_id`) and `$navigation_type`, including
   `navigate`, `reload`, `back_forward` and `prerender` on the first one.

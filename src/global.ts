@@ -60,7 +60,7 @@ const BOOLEANS = [
   'debug', 'analytics', 'errors', 'autocapture', 'auto-pageviews', 'engagement', 'auto-events', 'send-default-pii', 'cross-subdomain-cookie',
   'opt-out-by-default', 'respect-dnt', 'filter-bots', 'gzip', 'persist-queue', 'disable-persistence', 'dedupe',
 ] as const;
-const STRINGS = ['host', 'release', 'environment', 'persistence', 'not-found'] as const;
+const STRINGS = ['host', 'release', 'environment', 'persistence', 'cookieless-mode', 'not-found'] as const;
 const NUMBERS = ['sample-rate', 'error-sample-rate', 'flush-at', 'flush-interval-ms', 'session-timeout-ms', 'max-breadcrumbs'] as const;
 
 export function optionsFromAttributes(script: Element): VinktarOptions {

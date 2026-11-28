@@ -300,6 +300,24 @@ out on the next page; `optIn()` removes it again and lasts for the page. With `o
 and no persistence, call `optIn()` on every page load once your own consent record says yes.
 `respectDnt: true` honours Do Not Track and Global Privacy Control by never starting.
 
+With a cookie banner, `cookielessMode` decides what happens around the visitor's answer:
+
+```ts
+init({ writeKey, cookielessMode: 'on_reject' });
+banner.onAccept(() => optIn());
+banner.onReject(() => optOut());
+```
+
+| `cookielessMode` | Before an answer | After `optIn()` | After `optOut()` |
+| --- | --- | --- | --- |
+| unset | sends, as `persistence` says (nothing with `optOutByDefault`) | sends | sends nothing |
+| `'on_reject'` | sends and stores nothing | stores ids as `persistence` says | removes them, counts cookieless |
+| `'always'` | cookieless | cookieless | cookieless |
+
+With `'on_reject'` the page view held back while the visitor decided is sent when they answer, and
+the answer is remembered for their next page. `optOutByDefault: true`, or `respectDnt: true` with Do
+Not Track on, counts as a no until `optIn()`: cookieless from the first page view, not silent.
+
 To keep your own visits out of the numbers, run this once in the browser's console on your site:
 
 ```js

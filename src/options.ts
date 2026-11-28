@@ -61,6 +61,12 @@ export interface VinktarOptions {
    * device or session id is sent, and the server counts visitors and visits itself.
    */
   persistence?: Persistence;
+  /**
+   * `'always'`: cookieless, whatever the visitor chooses. `'on_reject'`: nothing is sent until the
+   * visitor answers; `optIn()` stores ids as `persistence` says, and `optOut()` removes them and
+   * goes on counting cookieless. Unset, `optOut()` stops everything.
+   */
+  cookielessMode?: 'always' | 'on_reject';
 
   /** `$pageview` on load and on history changes. An object picks which URL parts count as a change. */
   autoPageviews?: boolean | { path?: boolean; search?: boolean; hash?: boolean };
@@ -155,6 +161,9 @@ export interface Resolved {
   readonly gzip: boolean;
   readonly persistQueue: boolean;
   readonly persistence: Persistence;
+  readonly cookielessMode: 'always' | 'on_reject' | null;
+  /** `on_reject` with `optOutByDefault`, or with `respectDnt` and Do Not Track on: declined until `optIn()`. */
+  readonly declinedByDefault: boolean;
   readonly autoPageviews: { enabled: boolean; path: boolean; search: boolean; hash: boolean };
   readonly engagement: boolean;
   readonly autoEvents: boolean;
@@ -205,7 +214,7 @@ export const DEFAULT_HOST = 'https://in.vinktar.com';
 const KNOWN = new Set<keyof VinktarOptions>([
   'writeKey', 'key', 'host', 'enabled', 'debug', 'analytics', 'errors', 'autoCaptureErrors', 'release', 'environment',
   'enabledEnvironments', 'flushAt', 'flushIntervalMs', 'maxQueueSize', 'requestTimeoutMs', 'shutdownTimeout', 'gzip', 'persistQueue',
-  'persistence', 'autoPageviews', 'engagement', 'autoEvents', 'notFound', 'autocapture', 'sessionTimeoutMs', 'sessionMaxMs', 'breadcrumbs', 'maxBreadcrumbs', 'sampleRate',
+  'persistence', 'cookielessMode', 'autoPageviews', 'engagement', 'autoEvents', 'notFound', 'autocapture', 'sessionTimeoutMs', 'sessionMaxMs', 'breadcrumbs', 'maxBreadcrumbs', 'sampleRate',
   'errorSampleRate', 'maxErrorsPerMinute', 'maxEventsPerMinute', 'dedupe', 'ignoreErrors', 'denyUrls', 'allowUrls',
   'disableErrorDefaults', 'superProperties', 'sendDefaultPii', 'redactedKeys', 'propertyDenylist', 'disablePersistence',
   'crossSubdomainCookie', 'useBeacon', 'optOutByDefault', 'respectDnt', 'filterBots', 'propagateIdentity', 'initialScope',
@@ -297,7 +306,11 @@ export function resolve(options: VinktarOptions, logger: Logger, broken?: string
   }
 
   const respectDnt = options.respectDnt ?? false;
-  if (respectDnt && doNotTrack()) inert ??= 'Do Not Track / Global Privacy Control is on and respectDnt is set';
+  const cookielessMode = options.cookielessMode === 'always' || options.cookielessMode === 'on_reject' ? options.cookielessMode : null;
+  if (options.cookielessMode !== undefined && cookielessMode === null) warn(`cookielessMode must be 'always' or 'on_reject'; ignored`);
+  const dnt = respectDnt && doNotTrack();
+  // With on_reject, Do Not Track is a "no": counted cookieless rather than not at all.
+  if (dnt && cookielessMode !== 'on_reject') inert ??= 'Do Not Track / Global Privacy Control is on and respectDnt is set';
 
   const initial: { tags?: unknown; context?: unknown } = isObject(options.initialScope) ? options.initialScope : {};
   const pageviews = options.autoPageviews ?? true;
@@ -332,6 +345,8 @@ export function resolve(options: VinktarOptions, logger: Logger, broken?: string
     gzip: options.gzip ?? true,
     persistQueue: options.persistQueue ?? true,
     persistence,
+    cookielessMode,
+    declinedByDefault: cookielessMode === 'on_reject' && ((options.optOutByDefault ?? false) || dnt),
     autoPageviews:
       typeof pageviews === 'object'
         ? { enabled: true, path: pageviews.path ?? true, search: pageviews.search ?? false, hash: pageviews.hash ?? false }

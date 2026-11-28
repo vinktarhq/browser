@@ -11,8 +11,8 @@ Pageviews, time on page, events and identities on one side; uncaught errors, rej
 breadcrumbs that led to them on the other. Both go to [Vinktar](https://vinktar.com) over one
 connection, so an error can be read next to what the person was doing.
 
-Cookieless by default: nothing is written to cookies or storage, and visitors and visits are
-counted by the server. Persistent identity is one option away for apps that have consent.
+A visitor keeps one id in a first-party cookie, so they are the same visitor from page to page and
+day to day, and `identify()` joins what they did before signing in. Cookieless is one option away.
 
 The setup guide, and how to check that data arrives: [vinktar.com/docs/install/browser](https://vinktar.com/docs/install/browser).
 
@@ -46,7 +46,7 @@ dropped.
 
 - [Getting a key](#getting-a-key)
 - [Analytics](#analytics)
-- [Cookieless, or persistent identity](#cookieless-or-persistent-identity)
+- [Where the ids are kept](#where-the-ids-are-kept)
 - [Identity](#identity)
 - [Errors](#errors)
 - [Consent and privacy](#consent-and-privacy)
@@ -163,31 +163,35 @@ and action), never the text on it and never a field's value.
 ### What every event carries
 
 The current URL (origin and path only, by default), referrer, UTM parameters, screen and viewport
-size, language and timezone. With `persistence: 'localStorage'`, also the referrer and campaign of
-the **first** visit as `$initial_*` properties.
+size, language and timezone. Unless cookieless, also the referrer and campaign of the **first**
+visit as `$initial_*` properties.
 
-## Cookieless, or persistent identity
+## Where the ids are kept
 
-By default the SDK is cookieless. It writes nothing to cookies, localStorage or sessionStorage
-(the one exception: an explicit `optOut()` is remembered, see below), and sends no `device_id` and
-no `session_id`. The server counts a visitor from a hash of the IP address, the user agent and the
-project under a salt that changes every day, and a visit as activity with no gap of 30 minutes. A
-visitor can be counted again the next day, and cannot be followed from one day to the next.
+| `persistence` | Device, user, session, consent | Queue, `register()`, `$initial_*` |
+| --- | --- | --- |
+| `'localStorage+cookie'` (default) | a first-party cookie | localStorage |
+| `'cookie'` | a first-party cookie | memory, for the page |
+| `'localStorage'` | localStorage | localStorage |
+| `'memory'` | nothing: cookieless | memory, for the page |
 
-What that costs: the SDK cannot link visits across days, and nothing outlives the page.
-`identify()` still works for the life of the page: the user id is held in memory and sent as
-`user_id` on every event from it, and traits are sent. `register()` properties last for the page,
-the queue is not kept across a reload, and `getDeviceId()` and `getSessionId()` return `''`.
-Errors are reported exactly as before, with the user id when there is one and no device id.
-
-Apps that have the visitor's consent to store an identifier can keep one:
+The cookie is the SDK's own, on your domain, and lasts a year. It is only on the current host
+unless `crossSubdomainCookie: true` puts it on the registrable domain. A visitor whose ids an
+earlier version kept in localStorage keeps them: they are copied into the cookie the first time
+they are read.
 
 ```ts
-init({ writeKey, persistence: 'localStorage' });
+init({ writeKey, persistence: 'memory' });   // cookieless
 ```
 
-With it, the device id, sessions, the user, `register()` properties, `$initial_*` attribution and
-the queue are stored and survive reloads, as the next section describes.
+Cookieless writes nothing to cookies, localStorage or sessionStorage (the one exception: an
+explicit `optOut()` is remembered, see below), and sends no `device_id` and no `session_id`. The
+server counts a visitor from a hash of the IP address, the user agent and the project under a salt
+that changes every day, and a visit as activity with no gap of 30 minutes. A visitor can be counted
+again the next day, and cannot be followed from one day to the next. `identify()` works for the
+life of the page: the user id is held in memory and sent as `user_id` on every event from it, but
+nothing before it is joined to the user. `getDeviceId()` and `getSessionId()` return `''`. Errors
+are reported exactly as before, with the user id when there is one and no device id.
 
 ## Identity
 
@@ -202,10 +206,9 @@ Traits are flat values: the second argument is set every time, the third only th
 Reserved traits (`email`, `name`, `username`, `avatar`, `created`) are stored under their
 canonical `$`-prefixed names; you can spell them either way.
 
-With `persistence: 'localStorage'`, every visitor also gets a **device id** minted here and kept
-in storage, and `identify()` links the user to it, so what they did before signing in belongs to
-them too. Cookieless, there is no device to link, and the user id is sent on the page's events
-instead.
+Every visitor also gets a **device id** minted here and kept with the other ids, and `identify()`
+links the user to it, so what they did before signing in belongs to them too. Cookieless, there is
+no device to link, and the user id is sent on the page's events instead.
 
 **Call `reset()` on logout.** The server keeps the first link between a device and a user, so on a
 shared browser the next person would otherwise be attributed to the previous one. `reset()`
@@ -291,7 +294,7 @@ optOut();
 hasOptedOut();
 ```
 
-With `persistence: 'localStorage'`, consent is kept in storage and is not touched by `reset()`.
+Unless cookieless, consent is kept with the ids and is not touched by `reset()`.
 Cookieless, `optOut()` is the one thing the SDK writes to localStorage, so the visitor stays opted
 out on the next page; `optIn()` removes it again and lasts for the page. With `optOutByDefault`
 and no persistence, call `optIn()` on every page load once your own consent record says yes.
@@ -328,14 +331,14 @@ Every number is clamped to a sane range with a warning rather than taken as give
 | `requestTimeoutMs` | `10000` | Per request, including compression and reading the response. |
 | `shutdownTimeout` | `2000` | How long `close()` may spend on its final delivery. |
 | `gzip` | `true` | Compress bodies of 1 KiB and over. |
-| `persistence` | `'memory'` | Cookieless. `'localStorage'` keeps a device id, sessions and the user across loads. |
-| `persistQueue` | `true` | With `persistence: 'localStorage'`, keep the queue across navigations and crashes. |
+| `persistence` | `'localStorage+cookie'` | Or `'cookie'`, `'localStorage'`, `'memory'` (cookieless); see [Where the ids are kept](#where-the-ids-are-kept). |
+| `persistQueue` | `true` | Keep the queue in localStorage across navigations and crashes. Not with `'cookie'` or `'memory'`. |
 | `autoPageviews` | `true` | Or `{ path, search, hash }`. |
 | `engagement` | `true` | `$engagement` events: time on page and scroll depth. |
 | `autoEvents` | `false` | `link_clicked`, `file_downloaded` and `form_submitted`. |
 | `notFound` | | A string or regular expression matched against the title; a match sends `page_not_found`. |
 | `autocapture` | `false` | Or `{ clicks, forms }`. |
-| `sessionTimeoutMs` / `sessionMaxMs` | 30 min / 24 h | With `persistence: 'localStorage'`. |
+| `sessionTimeoutMs` / `sessionMaxMs` | 30 min / 24 h | Not with `'memory'`, where the server makes visits. |
 | `breadcrumbs` | `true` | Or `{ console, network, navigation, click }`. |
 | `maxBreadcrumbs` | `30` | At most 50. |
 | `sampleRate` / `errorSampleRate` | `1` | Per device / per issue, deterministic. |
@@ -346,11 +349,11 @@ Every number is clamped to a sane range with a warning rather than taken as give
 | `superProperties` | `{}` | On every event, under whatever `register()` persisted. |
 | `sendDefaultPii` | `false` | Full URLs, query strings and click ids. |
 | `redactedKeys` / `propertyDenylist` | `[]` | Extra key fragments to mask; top-level keys to drop. |
-| `crossSubdomainCookie` | `false` | With `persistence: 'localStorage'`; see [Identity](#identity). |
+| `crossSubdomainCookie` | `false` | Put the cookie on the registrable domain, so subdomains share the visitor. |
 | `disablePersistence` | `false` | The same as `persistence: 'memory'`. |
 | `useBeacon` | `true` | Use `sendBeacon` on unload when a keepalive request cannot carry the batch. |
 | `optOutByDefault` / `respectDnt` / `filterBots` | `false` / `false` / `true` | |
-| `propagateIdentity` | `[]` | With `persistence: 'localStorage'`: origins that get `X-Vinktar-Device-Id` and `X-Vinktar-Session-Id` on your own requests, so a server SDK stitches its events to this visit. |
+| `propagateIdentity` | `[]` | Not with `'memory'`. Origins that get `X-Vinktar-Device-Id` and `X-Vinktar-Session-Id` on your own requests, so a server SDK stitches its events to this visit. |
 | `initialScope` | `{}` | `{ tags, context }` for every error. |
 | `maxValueBytes` / `normalizeDepth` | `255` / `3` | The server's caps; cannot be raised. |
 | `includeRawStack` / `attachStacktrace` | `false` | Send the raw stack too; attach one to `captureMessage`. |
@@ -417,7 +420,7 @@ is offline do not count.
 When the page is hidden, which is the last thing a closed tab or a mobile browser sent to the
 background reliably reports, what is queued goes out with a beacon, or a keepalive request where
 a beacon is refused; `pagehide` sends only what was captured after that, so nothing goes twice.
-With `persistence: 'localStorage'` the queue is also persisted per tab and written synchronously
+With the queue in localStorage (the default) it is also persisted per tab and written synchronously
 first. A beacon never reports success, so its persisted copy stays, and the next page on the
 origin adopts any slot that is over a minute old and sends it; the server deduplicates on the
 event id.

@@ -14,17 +14,39 @@ beforeEach(() => {
 });
 
 describe('stores', () => {
-  it('prefers localStorage for data and keeps a per-tab store', () => {
-    const stores = createStores({ disablePersistence: false, crossSubdomainCookie: false });
-    expect(stores.data.kind).toBe('local');
-    expect(stores.tab.kind).toBe('session');
+  it('keeps the ids in a cookie and everything else in localStorage by default', () => {
+    const stores = createStores({ persistence: 'localStorage+cookie', crossSubdomainCookie: false });
+    expect([stores.identity.kind, stores.data.kind, stores.tab.kind]).toEqual(['cookie', 'local', 'session']);
     stores.data.set('a_1', 'x');
     stores.data.set('b_1', 'y');
     expect(stores.data.keys('a_')).toEqual(['a_1']);
+    stores.identity.set('vk_dev', 'd1');
+    expect(document.cookie).toContain('vk_dev=d1');
+    expect(localStorage.getItem('vk_dev')).toBeNull();
+    stores.identity.remove('vk_dev');
+  });
+
+  it('adopts ids an earlier version left in localStorage into the cookie', () => {
+    localStorage.setItem('vk_dev', 'from_03');
+    const stores = createStores({ persistence: 'localStorage+cookie', crossSubdomainCookie: false });
+    expect(stores.identity.get('vk_dev')).toBe('from_03');
+    expect(document.cookie).toContain('vk_dev=from_03');
+    stores.identity.remove('vk_dev');
+    expect(localStorage.getItem('vk_dev')).toBeNull();
+  });
+
+  it("uses the cookie alone with 'cookie', and localStorage alone with 'localStorage'", () => {
+    const jar = createStores({ persistence: 'cookie', crossSubdomainCookie: false });
+    expect([jar.identity.kind, jar.data.kind]).toEqual(['cookie', 'memory']);
+    const local = createStores({ persistence: 'localStorage', crossSubdomainCookie: false });
+    expect([local.identity.kind, local.data.kind]).toEqual(['local', 'local']);
+    local.identity.set('vk_dev', 'd2');
+    expect(document.cookie).not.toContain('vk_dev=d2');
+    local.identity.remove('vk_dev');
   });
 
   it('is memory only when persistence is disabled, and remembers only an opt-out', () => {
-    const stores = createStores({ disablePersistence: true, crossSubdomainCookie: false });
+    const stores = createStores({ persistence: 'memory', crossSubdomainCookie: false });
     expect([stores.identity.kind, stores.data.kind, stores.tab.kind]).toEqual(['memory', 'memory', 'memory']);
     const id = new Identity(stores, 'vnk_pk_x', { sessionTimeoutMs: 1000, sessionMaxMs: 5000, optOutByDefault: false }, logger);
     id.sessionId();

@@ -133,7 +133,7 @@ export class Vinktar {
     const ns = namespaceFor(this.o.writeKey);
     this.keys = { sup: `${ns}_sup`, attr: `${ns}_attr` };
     this.stores = createStores({
-      disablePersistence: this.o.persistence === 'memory' || this.inert !== null,
+      persistence: this.inert !== null ? 'memory' : this.o.persistence,
       crossSubdomainCookie: this.o.crossSubdomainCookie,
       onLarge: (key, bytes) => this.logger.warn(`the ${key} cookie is ${bytes} bytes; browsers drop cookies near 4 KiB`),
     });

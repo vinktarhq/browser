@@ -37,7 +37,7 @@ afterEach(async () => {
 const KEY = 'vnk_pk_test_key_0001';
 // happy-dom reports `navigator.webdriver`, so the bot filter would (correctly) drop every analytics event.
 // Most of these tests are about identity, which only persistent mode has; COOKIELESS is the default.
-const COOKIELESS = { writeKey: KEY, logger, filterBots: false } as const;
+const COOKIELESS = { writeKey: KEY, logger, filterBots: false, persistence: 'memory' } as const;
 const BASE = { ...COOKIELESS, persistence: 'localStorage' } as const;
 
 describe('init', () => {
@@ -195,7 +195,7 @@ describe('web analytics', () => {
     window.history.replaceState({}, '', '/');
   });
 
-  it('is cookieless by default: no ids sent and nothing stored, a user id for the life of the page', async () => {
+  it("is cookieless with persistence: 'memory': no ids sent and nothing stored, a user id for the life of the page", async () => {
     document.cookie.split(';').forEach((c) => (document.cookie = `${c.split('=')[0]}=; Max-Age=0`));
     const client = make({ ...COOKIELESS, useBeacon: false });
     client.identify('user_1');

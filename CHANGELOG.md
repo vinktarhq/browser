@@ -2,20 +2,15 @@
 
 ## 0.4.0
 
-Web analytics that count what a visitor actually saw, without cookies. Two changes need action
-when upgrading: read "Changed".
+Web analytics that count what a visitor actually saw, and a cookieless mode beside them. One change
+needs action when upgrading: `$pageleave` becomes `$engagement`, read "Changed".
 
 ### Changed
 
-- **Cookieless by default.** Nothing is written to cookies, localStorage or sessionStorage, and
-  events and errors carry no `device_id` and no `session_id`; the server counts visitors from a
-  daily-salted hash and visits from 30 minutes of inactivity. `identify()` still sends the user id
-  on every event for the life of the page. `$initial_*` attribution, persisted `register()`
-  properties and the persisted queue need storage and are gone in this mode. The only thing
-  written is an explicit `optOut()`, so the visitor stays opted out. To keep the previous
-  behaviour (device id, sessions, identity across loads), pass `persistence: 'localStorage'`, or
-  `data-persistence="localStorage"` on the script tag. `disablePersistence: true` now means the
-  same as the default; `crossSubdomainCookie` and `propagateIdentity` need persistence.
+- **The device, user, session and consent now live in a first-party cookie**, and everything else
+  stays in localStorage: `persistence: 'localStorage+cookie'`, the new default. A visitor whose ids
+  0.3 kept in localStorage keeps them; they are copied into the cookie the first time they are read.
+  `persistence: 'localStorage'` keeps 0.3's layout, with no cookie unless `crossSubdomainCookie`.
 - **`$pageleave` is replaced by `$engagement`, and it is on by default.** It is sent every time
   the page is hidden and before every route change, with `$engaged_ms` (visible time since the
   last one, an increment to sum, never 0, at most 30 minutes), `$scroll_depth` (the furthest seen,
@@ -36,6 +31,12 @@ when upgrading: read "Changed".
 - The main bundle is about 1.6 kB larger.
 
 ### Added
+
+- `persistence` picks where the ids live: `'localStorage+cookie'` (default), `'cookie'`,
+  `'localStorage'`, or `'memory'`, which is cookieless: nothing is stored, no `device_id` or
+  `session_id` is sent, and the server counts visitors from a daily-salted hash and visits from 30
+  minutes of inactivity. `identify()` then lasts for the page and joins nothing before it.
+  `disablePersistence: true` is the same as `'memory'`. On the script tag, `data-persistence`.
 
 - Every `$pageview` carries `$pageview_id` (its own `event_id`) and `$navigation_type`, including
   `navigate`, `reload`, `back_forward` and `prerender` on the first one.

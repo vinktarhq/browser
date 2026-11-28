@@ -215,14 +215,42 @@ export interface Stores {
   readonly tab: Store;
 }
 
+export type Persistence = 'localStorage+cookie' | 'cookie' | 'localStorage' | 'memory';
+
 export interface StoreOptions {
-  readonly disablePersistence: boolean;
+  readonly persistence: Persistence;
   readonly crossSubdomainCookie: boolean;
   readonly onLarge?: (key: string, bytes: number) => void;
 }
 
+/**
+ * The cookie, falling back to what an earlier version left in localStorage: a visitor whose ids
+ * were stored there keeps them, copied into the cookie the first time they are read.
+ */
+function adopting(primary: Store, legacy: Store | null): Store {
+  if (legacy === null || legacy === primary) return primary;
+
+  return {
+    kind: primary.kind,
+    get: (key) => {
+      const own = primary.get(key);
+      if (own !== null) return own;
+      const old = legacy.get(key);
+      if (old !== null) primary.set(key, old);
+
+      return old;
+    },
+    set: (key, value) => primary.set(key, value),
+    remove: (key) => {
+      primary.remove(key);
+      legacy.remove(key);
+    },
+    keys: (prefix) => [...new Set([...primary.keys(prefix), ...legacy.keys(prefix)])],
+  };
+}
+
 export function createStores(options: StoreOptions): Stores {
-  if (options.disablePersistence) {
+  if (options.persistence === 'memory') {
     return { persistent: false, identity: memoryStore(), consent: webStore('local', false) ?? memoryStore(), data: memoryStore(), tab: memoryStore() };
   }
 
@@ -237,13 +265,21 @@ export function createStores(options: StoreOptions): Stores {
       ...(options.onLarge ? { onLarge: options.onLarge } : {}),
     });
 
-  const identity = (options.crossSubdomainCookie ? cookie() ?? local : local ?? cookie()) ?? memoryStore();
+  // Device, user, session and consent live in a first-party cookie unless localStorage was asked for.
+  const jar = options.persistence === 'localStorage' && !options.crossSubdomainCookie ? null : cookie();
+  const identity =
+    options.persistence === 'localStorage'
+      ? ((options.crossSubdomainCookie ? jar ?? local : local ?? jar) ?? memoryStore())
+      : jar !== null
+        ? adopting(jar, local)
+        : (local ?? memoryStore());
 
   return {
     persistent: true,
     identity,
     consent: identity,
-    data: local ?? memoryStore(),
+    // Queues, super properties and attribution are never a cookie; `cookie` keeps them in memory.
+    data: options.persistence === 'cookie' ? memoryStore() : (local ?? memoryStore()),
     tab: session ?? memoryStore(),
   };
 }

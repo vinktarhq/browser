@@ -6,6 +6,7 @@ import { isObject, readOptions as readKnown, safeString } from './core/guard.js'
 import { toHookList } from './core/hooks.js';
 import type { Props } from './core/normalize.js';
 import { natives } from './browser/natives.js';
+import type { Persistence } from './browser/storage.js';
 import type { CrumbHook, EventHook, Integration } from './types.js';
 
 /**
@@ -51,14 +52,15 @@ export interface VinktarOptions {
   shutdownTimeout?: number;
   /** Compress bodies of 1 KiB and over. */
   gzip?: boolean;
-  /** Keep the queue in localStorage across navigations and crashes. Needs `persistence: 'localStorage'`. */
+  /** Keep the queue in localStorage across navigations and crashes. Not with `persistence: 'cookie'` or `'memory'`. */
   persistQueue?: boolean;
   /**
-   * `'memory'` (the default) is cookieless: nothing is stored and no device or session id is sent,
-   * and the server counts visitors and visits itself. `'localStorage'` keeps a device id, sessions
-   * and the user across page loads, for apps that have the visitor's consent to do so.
+   * Where the visitor's ids live. `'localStorage+cookie'` (the default) keeps the device, user and
+   * session in a first-party cookie and everything else in localStorage. `'cookie'` uses the cookie
+   * alone, `'localStorage'` localStorage alone. `'memory'` is cookieless: nothing is stored, no
+   * device or session id is sent, and the server counts visitors and visits itself.
    */
-  persistence?: 'memory' | 'localStorage';
+  persistence?: Persistence;
 
   /** `$pageview` on load and on history changes. An object picks which URL parts count as a change. */
   autoPageviews?: boolean | { path?: boolean; search?: boolean; hash?: boolean };
@@ -100,9 +102,9 @@ export interface VinktarOptions {
   redactedKeys?: string[];
   /** Top-level property names dropped outright. */
   propertyDenylist?: string[];
-  /** The same as `persistence: 'memory'`, which is now the default. */
+  /** The same as `persistence: 'memory'`. */
   disablePersistence?: boolean;
-  /** With `persistence: 'localStorage'`: share the device and session across subdomains via a cookie. */
+  /** Share the device and session across subdomains via a cookie on the registrable domain. */
   crossSubdomainCookie?: boolean;
   /** Use `sendBeacon` on unload when a keepalive fetch cannot carry the batch. */
   useBeacon?: boolean;
@@ -152,7 +154,7 @@ export interface Resolved {
   readonly shutdownTimeout: number;
   readonly gzip: boolean;
   readonly persistQueue: boolean;
-  readonly persistence: 'memory' | 'localStorage';
+  readonly persistence: Persistence;
   readonly autoPageviews: { enabled: boolean; path: boolean; search: boolean; hash: boolean };
   readonly engagement: boolean;
   readonly autoEvents: boolean;
@@ -195,6 +197,8 @@ export interface Resolved {
   readonly inert: string | null;
   readonly warnings: readonly string[];
 }
+
+const PERSISTENCE: readonly Persistence[] = ['localStorage+cookie', 'cookie', 'localStorage', 'memory'];
 
 export const DEFAULT_HOST = 'https://in.vinktar.com';
 
@@ -299,12 +303,14 @@ export function resolve(options: VinktarOptions, logger: Logger, broken?: string
   const pageviews = options.autoPageviews ?? true;
   const autocapture = options.autocapture ?? false;
   const crumbs = options.breadcrumbs ?? true;
-  const persistence = options.disablePersistence === true || options.persistence !== 'localStorage' ? 'memory' : 'localStorage';
-  if (options.persistence !== undefined && options.persistence !== 'memory' && options.persistence !== 'localStorage') {
-    warn(`persistence must be 'memory' or 'localStorage'; using 'memory'`);
+  const known = PERSISTENCE.includes(options.persistence as Persistence);
+  if (options.persistence !== undefined && !known) {
+    warn(`persistence must be one of ${PERSISTENCE.map((p) => `'${p}'`).join(', ')}; using 'localStorage+cookie'`);
   }
+  const persistence: Persistence =
+    options.disablePersistence === true ? 'memory' : known ? (options.persistence as Persistence) : 'localStorage+cookie';
   if (persistence === 'memory' && (options.crossSubdomainCookie === true || (Array.isArray(options.propagateIdentity) && options.propagateIdentity.length > 0))) {
-    warn(`crossSubdomainCookie and propagateIdentity need persistence: 'localStorage'; ignored`);
+    warn(`crossSubdomainCookie and propagateIdentity need the visitor's ids stored; ignored with persistence: 'memory'`);
   }
   const maxValueBytes = clamp('maxValueBytes', options.maxValueBytes, 16, MAX_STRING_BYTES, MAX_STRING_BYTES);
 
